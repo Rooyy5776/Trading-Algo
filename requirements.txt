@@ -1,0 +1,6 @@
+flask
+requests
+gunicorn
+websocket-client
+psutil
+aiohttp
