@@ -31,11 +31,9 @@ jobs:
         script: |
           cd /home/ubuntu/apex-bot
           
-          # पाइथन का वर्चुअल एनवायरनमेंट बनाना (अगर नहीं है तो)
-          if [ ! -d "venv" ]; then
-            python3 -m venv venv
-          fi
+          # पाइथन पिप को अपडेट करना
+          sudo apt update -y
+          sudo apt install -y python3-pip
           
-          # उसे चालू करना और लाइब्रेरी इंस्टॉल करना
-          source venv/bin/activate
-          pip install -r requirements.txt
+          # बिना किसी एरर के सीधा लाइब्रेरी इंस्टॉल करना
+          pip3 install --break-system-packages -r requirements.txt
