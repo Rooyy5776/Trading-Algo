@@ -1,0 +1,41 @@
+name: Deploy Apex Bot to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Copy files to EC2
+      uses: appleboy/scp-action@v0.1.4
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+        source: "."
+        target: "/home/ubuntu/apex-bot"
+
+    - name: Install Dependencies
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+        script: |
+          cd /home/ubuntu/apex-bot
+          
+          # पाइथन का वर्चुअल एनवायरनमेंट बनाना (अगर नहीं है तो)
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+          
+          # उसे चालू करना और लाइब्रेरी इंस्टॉल करना
+          source venv/bin/activate
+          pip install -r requirements.txt
