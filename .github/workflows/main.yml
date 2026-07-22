@@ -31,9 +31,16 @@ jobs:
         script: |
           cd /home/ubuntu/apex-bot
           
+          # Ubuntu में पाइथन के जरूरी टूल्स इंस्टॉल करना
+          sudo apt update -y
+          sudo apt install -y python3-venv python3-pip
+          
+          # वर्चुअल एनवायरनमेंट बनाना
           if [ ! -d "venv" ]; then
             python3 -m venv venv
           fi
           
+          # लाइब्रेरीज़ इंस्टॉल करना
           source venv/bin/activate
+          pip install --upgrade pip
           pip install -r requirements.txt
