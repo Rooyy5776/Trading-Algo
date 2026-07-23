@@ -103,6 +103,7 @@ import sqlite3
 import threading
 import traceback
 import statistics
+import re
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
@@ -978,6 +979,498 @@ liquidation_aggregator = LiquidationAggregator()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# AI MARKET CONSENSUS ORACLE — merged in from the standalone ai_oracle.py
+# (Phase 1) into this same process/file, upgraded to an "Institutional
+# Edition" ensemble along the way. Runs as ONE MORE background daemon thread
+# — same pattern as _background_refresh_loop() and _self_check_loop() below,
+# same `delta_http` session, same control_flags table. No more separate
+# process, no asyncio — a synchronous thread loop using plain `requests`,
+# exactly like everything else here.
+#
+# TWO independent "votes" every tick, then an ensemble combine:
+#   1. Gemini vote   — reads the live footprint, gives a label + confidence
+#                       (reuses the SAME GEMINI_API_KEY/GEMINI_MODEL already
+#                       configured for the /ask Q&A panel above).
+#   2. Quant vote     — a deterministic score from real order-book/trade/
+#                       funding data. Needs no API key and can't go down with
+#                       Gemini, so the oracle always has an opinion.
+# A circuit breaker stops calling Gemini after repeated failures (falls back
+# to quant-only, "degraded_mode": true). An accuracy tracker logs every
+# consensus with the mark price at the time and later scores itself against
+# what price actually did — so "is this oracle any good" is a real number,
+# not a vibe.
+#
+# [NEW] AI GATEKEEPER — answers the open question left in the last
+# consolidation pass ("should the oracle's read actually affect trades, or
+# stay informational?"). OFF by default (AI_ORACLE_GATE_TRADES=false). When
+# turned on, it is a STRICT VETO ONLY: it can block an entry that actively
+# conflicts with a high-confidence oracle read, it can never approve or size
+# up a trade Pine/ConfidenceEngine/Neural Syndicate already rejected, and a
+# NEUTRAL or low-confidence oracle read always passes through untouched.
+# ════════════════════════════════════════════════════════════════════════════════
+ORACLE_SYMBOLS = [s.strip().upper() for s in
+                  os.environ.get("ORACLE_SYMBOLS", "BTCUSD,ETHUSD").split(",") if s.strip()]
+ORACLE_INTERVAL_S = int(os.environ.get("ORACLE_INTERVAL_S", "60"))
+ORACLE_TRADE_LOOKBACK = int(os.environ.get("ORACLE_TRADE_LOOKBACK", "100"))
+
+ORACLE_W_DEPTH = float(os.environ.get("ORACLE_W_DEPTH", "0.35"))
+ORACLE_W_TAKER = float(os.environ.get("ORACLE_W_TAKER", "0.35"))
+ORACLE_W_MOMENTUM = float(os.environ.get("ORACLE_W_MOMENTUM", "0.20"))
+ORACLE_W_FUNDING = float(os.environ.get("ORACLE_W_FUNDING", "0.10"))
+ORACLE_QUANT_THRESHOLD = float(os.environ.get("ORACLE_QUANT_THRESHOLD", "0.15"))
+ORACLE_MOMENTUM_NORMALIZER_PCT = float(os.environ.get("ORACLE_MOMENTUM_NORMALIZER_PCT", "0.30"))
+ORACLE_FUNDING_NORMALIZER = float(os.environ.get("ORACLE_FUNDING_NORMALIZER", "0.01"))
+
+ORACLE_W_GEMINI = float(os.environ.get("ORACLE_W_GEMINI", "0.5"))
+ORACLE_W_QUANT = float(os.environ.get("ORACLE_W_QUANT", "0.5"))
+ORACLE_ENSEMBLE_THRESHOLD = float(os.environ.get("ORACLE_ENSEMBLE_THRESHOLD", "0.12"))
+
+ORACLE_CB_FAILURE_THRESHOLD = int(os.environ.get("ORACLE_CB_FAILURE_THRESHOLD", "5"))
+ORACLE_CB_COOLDOWN_S = float(os.environ.get("ORACLE_CB_COOLDOWN_S", "300"))
+
+ORACLE_ACCURACY_LOOKAHEAD_S = float(os.environ.get("ORACLE_ACCURACY_LOOKAHEAD_S", "900"))
+ORACLE_ACCURACY_FLAT_PCT = float(os.environ.get("ORACLE_ACCURACY_FLAT_PCT", "0.05"))
+ORACLE_ACCURACY_WINDOW = int(os.environ.get("ORACLE_ACCURACY_WINDOW", "200"))
+
+# [NEW] AI Gatekeeper — see docstring above. Deliberately OFF by default.
+AI_ORACLE_GATE_TRADES = os.environ.get("AI_ORACLE_GATE_TRADES", "false").strip().lower() == "true"
+AI_ORACLE_GATE_MIN_CONFIDENCE = float(os.environ.get("AI_ORACLE_GATE_MIN_CONFIDENCE", "0.55"))
+
+
+def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
+
+
+def fetch_oracle_footprint(symbol: str) -> Dict:
+    """One clean footprint per symbol: order-book depth imbalance (reuses the
+    same /v2/l2orderbook logic as fetch_live_orderbook_imbalance above, but
+    keeps its own bid/ask qty split), recent taker order-flow + momentum, and
+    ticker context (funding rate, open interest, 24h range). Every sub-fetch
+    degrades to None on failure rather than raising — one bad endpoint never
+    blocks the whole tick."""
+    orderbook = None
+    try:
+        resp = delta_http.get(f"{BASE_URL}/v2/l2orderbook/{symbol}", timeout=4)
+        resp.raise_for_status()
+        result = resp.json().get("result", {})
+        buy_levels = result.get("buy", [])[:10]
+        sell_levels = result.get("sell", [])[:10]
+        bid_qty = sum(float(lvl.get("size", 0)) for lvl in buy_levels)
+        ask_qty = sum(float(lvl.get("size", 0)) for lvl in sell_levels)
+        total_qty = bid_qty + ask_qty
+        imbalance = 0.0 if total_qty <= 0 else _clamp((bid_qty - ask_qty) / total_qty)
+        orderbook = {"bid_depth_qty": round(bid_qty, 6), "ask_depth_qty": round(ask_qty, 6),
+                     "depth_imbalance": round(imbalance, 4)}
+    except Exception as e:
+        log.debug(f"Oracle orderbook fetch skipped for {symbol}: {e}")
+
+    order_flow = None
+    try:
+        resp = delta_http.get(f"{BASE_URL}/v2/trades/{symbol}",
+                               params={"page_size": ORACLE_TRADE_LOOKBACK}, timeout=4)
+        resp.raise_for_status()
+        trades = resp.json().get("result", []) or []
+        buy_vol = sell_vol = 0.0
+        prices = []
+        for t in trades:
+            try:
+                size = float(t.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            side = (t.get("side") or "").lower()
+            if side == "buy":
+                buy_vol += size
+            elif side == "sell":
+                sell_vol += size
+            p = t.get("price")
+            if p is not None:
+                try:
+                    prices.append(float(p))
+                except (TypeError, ValueError):
+                    pass
+        total_vol = buy_vol + sell_vol
+        taker_delta = 0.0 if total_vol <= 0 else _clamp((buy_vol - sell_vol) / total_vol)
+        momentum_pct = None
+        # Delta's public trade feed returns most-recent-first: prices[0] is
+        # the newest print, prices[-1] the oldest in our lookback window.
+        if len(prices) >= 8:
+            quarter = max(2, len(prices) // 4)
+            recent_avg = statistics.fmean(prices[:quarter])
+            older_avg = statistics.fmean(prices[-quarter:])
+            if older_avg:
+                momentum_pct = round((recent_avg - older_avg) / older_avg * 100.0, 4)
+        order_flow = {"trade_count": len(trades), "taker_delta": round(taker_delta, 4),
+                      "momentum_pct": momentum_pct}
+    except Exception as e:
+        log.debug(f"Oracle trade-flow fetch skipped for {symbol}: {e}")
+
+    ticker = None
+    try:
+        resp = delta_http.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=4)
+        resp.raise_for_status()
+        result = resp.json().get("result", {}) or {}
+
+        def _f(key):
+            v = result.get(key)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        ticker = {"mark_price": _f("mark_price") or _f("close") or _f("spot_price"),
+                  "funding_rate": _f("funding_rate"), "open_interest": _f("oi"),
+                  "high_24h": _f("high"), "low_24h": _f("low")}
+    except Exception as e:
+        log.debug(f"Oracle ticker fetch skipped for {symbol}: {e}")
+
+    volatility_pct = None
+    if ticker and ticker.get("high_24h") and ticker.get("low_24h") and ticker.get("mark_price"):
+        try:
+            volatility_pct = round((ticker["high_24h"] - ticker["low_24h"]) / ticker["mark_price"] * 100.0, 4)
+        except (TypeError, ZeroDivisionError):
+            pass
+
+    return {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat(),
+            "orderbook": orderbook, "order_flow": order_flow, "ticker": ticker,
+            "volatility_pct_24h": volatility_pct}
+
+
+def compute_quant_vote(footprint: Dict) -> Dict:
+    """Deterministic second 'vote' — no LLM call, can't go down with Gemini."""
+    orderbook = footprint.get("orderbook") or {}
+    order_flow = footprint.get("order_flow") or {}
+    ticker = footprint.get("ticker") or {}
+
+    depth_imbalance = orderbook.get("depth_imbalance") or 0.0
+    taker_delta = order_flow.get("taker_delta") or 0.0
+    momentum_pct = order_flow.get("momentum_pct") or 0.0
+    funding_rate = ticker.get("funding_rate") or 0.0
+
+    momentum_component = _clamp(momentum_pct / ORACLE_MOMENTUM_NORMALIZER_PCT) if ORACLE_MOMENTUM_NORMALIZER_PCT else 0.0
+    # Contrarian: crowded-long (high +funding) tilts slightly bearish (mean
+    # reversion risk); crowded-short tilts slightly bullish.
+    funding_component = _clamp(-funding_rate / ORACLE_FUNDING_NORMALIZER) if ORACLE_FUNDING_NORMALIZER else 0.0
+
+    score = _clamp(ORACLE_W_DEPTH * depth_imbalance + ORACLE_W_TAKER * taker_delta +
+                    ORACLE_W_MOMENTUM * momentum_component + ORACLE_W_FUNDING * funding_component)
+
+    label = ("BULLISH" if score >= ORACLE_QUANT_THRESHOLD else
+             "BEARISH" if score <= -ORACLE_QUANT_THRESHOLD else "NEUTRAL")
+
+    return {"label": label, "score": round(score, 4), "confidence": round(abs(score), 4),
+            "features": {"depth_imbalance": depth_imbalance, "taker_delta": taker_delta,
+                         "momentum_pct": momentum_pct, "funding_rate": funding_rate}}
+
+
+class _OracleCircuitBreaker:
+    """Closed = calling Gemini normally. Open = short-circuited, quant-only
+    fallback for ORACLE_CB_COOLDOWN_S. Half-open = one trial call allowed
+    after the cooldown to see if Gemini has recovered."""
+    def __init__(self, failure_threshold: int, cooldown_s: float):
+        self.failure_threshold = failure_threshold
+        self.cooldown_s = cooldown_s
+        self.consecutive_failures = 0
+        self.state = "closed"
+        self.opened_at = None
+
+    def allow_call(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if self.opened_at is not None and (time.monotonic() - self.opened_at) >= self.cooldown_s:
+                self.state = "half_open"
+                return True
+            return False
+        return True
+
+    def record_success(self):
+        if self.state != "closed":
+            log.info("🟢 AI Oracle circuit breaker CLOSED — Gemini call succeeded again.")
+        self.consecutive_failures = 0
+        self.state = "closed"
+        self.opened_at = None
+
+    def record_failure(self):
+        self.consecutive_failures += 1
+        if self.state == "half_open":
+            self.state = "open"
+            self.opened_at = time.monotonic()
+            log.warning("🟡 AI Oracle circuit breaker re-OPENED — trial call failed.")
+        elif self.consecutive_failures >= self.failure_threshold and self.state == "closed":
+            self.state = "open"
+            self.opened_at = time.monotonic()
+            log.error(f"🔴 AI Oracle circuit breaker OPENED after {self.consecutive_failures} "
+                      f"consecutive Gemini failures — falling back to quant-only consensus for "
+                      f"{self.cooldown_s:.0f}s.")
+
+    def snapshot(self) -> Dict:
+        return {"state": self.state, "consecutive_failures": self.consecutive_failures,
+                "cooldown_remaining_s": (
+                    max(0.0, self.cooldown_s - (time.monotonic() - self.opened_at))
+                    if self.state == "open" and self.opened_at is not None else 0.0)}
+
+
+oracle_breaker = _OracleCircuitBreaker(ORACLE_CB_FAILURE_THRESHOLD, ORACLE_CB_COOLDOWN_S)
+
+_ORACLE_GEMINI_SYSTEM_PROMPT = (
+    "You are a strict market micro-structure classifier for a crypto perpetual "
+    "futures trading bot. You are given a JSON footprint for one symbol: order "
+    "book depth imbalance, recent taker order-flow (buy/sell split + short-term "
+    "price momentum from real executed trades), and funding/open-interest/"
+    "volatility context. Classify the immediate directional pressure as one of "
+    "BULLISH, BEARISH, or NEUTRAL, and give your confidence 0.0-1.0. Respond "
+    "with ONLY the label and confidence, space-separated — e.g. 'BULLISH 0.7'. "
+    "No punctuation, no explanation. If data is thin or contradictory, respond "
+    "'NEUTRAL 0.3'."
+)
+_ORACLE_GEMINI_RE = re.compile(r"(BULLISH|BEARISH|NEUTRAL)\D{0,5}(\d(?:\.\d+)?)", re.IGNORECASE)
+VALID_CONSENSUS_LABELS = {"BULLISH", "BEARISH", "NEUTRAL"}
+
+
+def get_gemini_oracle_vote(footprint: Dict) -> Optional[Dict]:
+    """Returns {"label", "confidence"} or None ("no opinion" — the circuit
+    breaker is open, no API key, or the call ultimately failed). None is
+    treated by combine_oracle_consensus() as pure quant-only for this tick."""
+    if not GEMINI_API_KEY or not oracle_breaker.allow_call():
+        return None
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"content-type": "application/json"},
+            params={"key": GEMINI_API_KEY},
+            json={"system_instruction": {"parts": [{"text": _ORACLE_GEMINI_SYSTEM_PROMPT}]},
+                  "contents": [{"role": "user", "parts": [{"text": json.dumps(footprint, default=str)}]}],
+                  "generationConfig": {"temperature": 0.0, "maxOutputTokens": 12}},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            oracle_breaker.record_failure()
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        raw_text = "".join(p.get("text", "") for p in parts).strip().upper()
+
+        match = _ORACLE_GEMINI_RE.search(raw_text)
+        if match:
+            try:
+                confidence = _clamp(float(match.group(2)), 0.0, 1.0)
+            except ValueError:
+                confidence = 0.5
+            oracle_breaker.record_success()
+            return {"label": match.group(1), "confidence": round(confidence, 4)}
+
+        for label in VALID_CONSENSUS_LABELS:
+            if label in raw_text:
+                oracle_breaker.record_success()
+                return {"label": label, "confidence": 0.5}
+
+        oracle_breaker.record_failure()
+        return None
+    except requests.exceptions.RequestException as e:
+        log.warning(f"AI Oracle Gemini call failed: {e}")
+        oracle_breaker.record_failure()
+        return None
+    except Exception as e:
+        log.error(f"AI Oracle Gemini unexpected error: {e}")
+        oracle_breaker.record_failure()
+        return None
+
+
+def _directional_value(label: str, confidence: float) -> float:
+    if label == "BULLISH":
+        return confidence
+    if label == "BEARISH":
+        return -confidence
+    return 0.0
+
+
+def combine_oracle_consensus(gemini_vote: Optional[Dict], quant_vote: Dict) -> Dict:
+    degraded = gemini_vote is None
+    if degraded:
+        combined_score = quant_vote["score"]
+    else:
+        g_value = _directional_value(gemini_vote["label"], gemini_vote["confidence"])
+        total_w = ORACLE_W_GEMINI + ORACLE_W_QUANT
+        combined_score = _clamp((ORACLE_W_GEMINI * g_value + ORACLE_W_QUANT * quant_vote["score"]) / total_w) \
+            if total_w else quant_vote["score"]
+
+    label = ("BULLISH" if combined_score >= ORACLE_ENSEMBLE_THRESHOLD else
+             "BEARISH" if combined_score <= -ORACLE_ENSEMBLE_THRESHOLD else "NEUTRAL")
+    agreement = (not degraded) and (gemini_vote["label"] == quant_vote["label"])
+
+    return {"label": label, "confidence": round(abs(combined_score), 4),
+            "combined_score": round(combined_score, 4), "degraded_mode": degraded,
+            "agreement": agreement, "gemini_vote": gemini_vote, "quant_vote": quant_vote}
+
+
+def record_oracle_prediction(symbol: str, consensus: str, confidence: float, mark_price: Optional[float]):
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO oracle_predictions (symbol, ts, consensus, confidence, mark_price) "
+                         "VALUES (?,?,?,?,?)",
+                         (symbol, datetime.now(timezone.utc).isoformat(), consensus, confidence, mark_price))
+            conn.commit()
+    except Exception as e:
+        log.error(f"record_oracle_prediction failed for {symbol}: {e}")
+
+
+def evaluate_oracle_predictions(symbol: str, current_mark_price: Optional[float]) -> Optional[float]:
+    """Scores any prediction for `symbol` at least ORACLE_ACCURACY_LOOKAHEAD_S
+    old against current_mark_price ('what actually happened'). Returns the
+    fresh rolling accuracy % (0-100), or None without enough history yet."""
+    if current_mark_price is None:
+        return None
+    try:
+        with db() as conn:
+            cutoff_iso = (datetime.now(timezone.utc) -
+                          timedelta(seconds=ORACLE_ACCURACY_LOOKAHEAD_S)).isoformat()
+            rows = conn.execute(
+                "SELECT id, consensus, mark_price FROM oracle_predictions "
+                "WHERE symbol=? AND evaluated=0 AND ts<=? AND mark_price IS NOT NULL",
+                (symbol, cutoff_iso)).fetchall()
+            for row in rows:
+                old_price = row["mark_price"]
+                if not old_price:
+                    conn.execute("UPDATE oracle_predictions SET evaluated=1, correct=NULL WHERE id=?", (row["id"],))
+                    continue
+                pct_move = (current_mark_price - old_price) / old_price * 100.0
+                actual = ("BULLISH" if pct_move > ORACLE_ACCURACY_FLAT_PCT else
+                          "BEARISH" if pct_move < -ORACLE_ACCURACY_FLAT_PCT else "NEUTRAL")
+                correct = 1 if row["consensus"] == actual else 0
+                conn.execute("UPDATE oracle_predictions SET evaluated=1, correct=? WHERE id=?",
+                             (correct, row["id"]))
+            conn.commit()
+
+            recent = conn.execute(
+                "SELECT correct FROM oracle_predictions WHERE symbol=? AND evaluated=1 "
+                "AND correct IS NOT NULL ORDER BY id DESC LIMIT ?",
+                (symbol, ORACLE_ACCURACY_WINDOW)).fetchall()
+        if not recent:
+            return None
+        return round(100.0 * sum(r["correct"] for r in recent) / len(recent), 2)
+    except Exception as e:
+        log.error(f"evaluate_oracle_predictions failed for {symbol}: {e}")
+        return None
+
+
+_oracle_health_lock = threading.Lock()
+_oracle_health: Dict[str, Dict] = {}
+_oracle_started_at = time.monotonic()
+_oracle_tick_count = 0
+
+
+def get_ai_oracle_snapshot() -> Dict:
+    """Everything the dashboard's AI Confidence Matrix / AI Oracle panels
+    need — per-symbol ensemble label, confidence, degraded/agreement flags,
+    rolling self-scored accuracy, and the Gemini circuit breaker state."""
+    with _oracle_health_lock:
+        symbols_snapshot = dict(_oracle_health)
+    return {
+        "uptime_s": round(time.monotonic() - _oracle_started_at, 1),
+        "tick_count": _oracle_tick_count,
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "gate_trades_enabled": AI_ORACLE_GATE_TRADES,
+        "circuit_breaker": oracle_breaker.snapshot(),
+        "symbols": symbols_snapshot,
+    }
+
+
+def ai_oracle_gate_check(symbol: str, direction: str) -> Tuple[bool, str]:
+    """[NEW] The AI Gatekeeper itself. Returns (True, "") to allow the entry
+    to proceed untouched, or (False, reason) to veto it. Only ever blocks —
+    never approves or upsizes a trade the earlier gates already rejected —
+    and only acts once the oracle's ensemble confidence for THIS symbol
+    clears AI_ORACLE_GATE_MIN_CONFIDENCE; a NEUTRAL or low-confidence read,
+    or a symbol the oracle hasn't ticked for yet, always passes through."""
+    if not AI_ORACLE_GATE_TRADES:
+        return True, ""
+    with _oracle_health_lock:
+        snap = _oracle_health.get(symbol)
+    if not snap or not snap.get("ok"):
+        return True, ""  # no opinion yet — never block on missing data
+    consensus = snap.get("consensus")
+    confidence = snap.get("confidence") or 0.0
+    if consensus == "NEUTRAL" or confidence < AI_ORACLE_GATE_MIN_CONFIDENCE:
+        return True, ""
+    wants_long = direction == "BUY"
+    wants_short = direction == "SELL"
+    if wants_long and consensus == "BEARISH":
+        return False, f"AI Oracle is BEARISH ({confidence:.0%} confidence) on {symbol}, conflicts with LONG entry"
+    if wants_short and consensus == "BULLISH":
+        return False, f"AI Oracle is BULLISH ({confidence:.0%} confidence) on {symbol}, conflicts with SHORT entry"
+    return True, ""
+
+
+def _ai_oracle_tick():
+    global _oracle_tick_count
+    for symbol in ORACLE_SYMBOLS:
+        try:
+            footprint = fetch_oracle_footprint(symbol)
+            quant_vote = compute_quant_vote(footprint)
+            gemini_vote = get_gemini_oracle_vote(footprint)
+            consensus = combine_oracle_consensus(gemini_vote, quant_vote)
+            mark_price = (footprint.get("ticker") or {}).get("mark_price")
+
+            set_control_flag(f"ai_consensus_{symbol}", consensus["label"])
+            set_control_flag(f"ai_consensus_{symbol}_confidence", str(consensus["confidence"]))
+            set_control_flag(f"ai_consensus_{symbol}_detail", json.dumps(consensus, default=str))
+            set_control_flag(f"ai_consensus_{symbol}_updated_at", datetime.now(timezone.utc).isoformat())
+
+            record_oracle_prediction(symbol, consensus["label"], consensus["confidence"], mark_price)
+            accuracy_pct = evaluate_oracle_predictions(symbol, mark_price)
+            if accuracy_pct is not None:
+                set_control_flag(f"ai_oracle_accuracy_{symbol}", str(accuracy_pct))
+
+            with _oracle_health_lock:
+                _oracle_health[symbol] = {
+                    "ok": True, "consensus": consensus["label"], "confidence": consensus["confidence"],
+                    "degraded_mode": consensus["degraded_mode"], "agreement": consensus["agreement"],
+                    "mark_price": mark_price, "rolling_accuracy_pct": accuracy_pct,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            log.info(f"🔮 AI Oracle {symbol}: consensus={consensus['label']} conf={consensus['confidence']} "
+                      f"degraded={consensus['degraded_mode']} accuracy={accuracy_pct}")
+        except Exception as e:
+            with _oracle_health_lock:
+                prev = _oracle_health.get(symbol, {})
+                _oracle_health[symbol] = {**prev, "ok": False, "last_error": str(e),
+                                           "last_error_at": datetime.now(timezone.utc).isoformat()}
+            log.error(f"AI Oracle tick failed for {symbol}: {e}")
+
+    if ORACLE_SYMBOLS:
+        last_symbol = ORACLE_SYMBOLS[-1]
+        last = _oracle_health.get(last_symbol, {})
+        if last.get("ok"):
+            set_control_flag("ai_consensus", last["consensus"])
+            set_control_flag("ai_consensus_symbol", last_symbol)
+            set_control_flag("ai_consensus_confidence", str(last["confidence"]))
+            set_control_flag("ai_consensus_updated_at", datetime.now(timezone.utc).isoformat())
+    _oracle_tick_count += 1
+
+
+def _ai_oracle_loop():
+    """Background daemon thread — same pattern as _background_refresh_loop()
+    and _self_check_loop() below. Runs forever, ticks every ORACLE_INTERVAL_S,
+    and a single symbol's failure (handled inside _ai_oracle_tick) never
+    takes the loop down."""
+    if not GEMINI_API_KEY:
+        log.warning("⚠️ GEMINI_API_KEY not set — AI Oracle will run on quant-only "
+                    "consensus (degraded_mode) until it's configured.")
+    if AI_ORACLE_GATE_TRADES:
+        log.warning(f"🔮 AI Oracle Gatekeeper is ENABLED — entries conflicting with a "
+                    f"≥{AI_ORACLE_GATE_MIN_CONFIDENCE:.0%}-confidence oracle read will be vetoed.")
+    log.info(f"🔮 AI Oracle loop starting — symbols={ORACLE_SYMBOLS} interval={ORACLE_INTERVAL_S}s")
+    while True:
+        try:
+            _ai_oracle_tick()
+        except Exception as e:
+            log.error(f"AI Oracle loop tick crashed (continuing): {e}\n{traceback.format_exc()}")
+        time.sleep(ORACLE_INTERVAL_S)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ════════════════════════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════════════════════════
@@ -994,6 +1487,7 @@ liquidation_aggregator = LiquidationAggregator()
 # ════════════════════════════════════════════════════════════════════════════════
 def db():
     # timeout=10: if the DB is briefly locked by another connection, wait up
+
     # to 10s and retry instead of failing immediately with "database is locked".
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -1040,6 +1534,16 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS self_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, category TEXT,
             message TEXT, detail TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # [AI ORACLE MERGE] Owned entirely by the AI Market Consensus Oracle
+        # above — logs every consensus call with the mark price at the time,
+        # so evaluate_oracle_predictions() can later score it against what
+        # price actually did and produce a real rolling accuracy %.
+        conn.execute("""CREATE TABLE IF NOT EXISTS oracle_predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, ts TEXT NOT NULL,
+            consensus TEXT NOT NULL, confidence REAL, mark_price REAL,
+            evaluated INTEGER DEFAULT 0, correct INTEGER)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_oracle_predictions_eval
+            ON oracle_predictions (symbol, evaluated, ts)""")
         conn.commit()
 
         # New Pine-sync columns (V12-P2 PLOTBUDGET_FIXED) — added via migration
@@ -2143,6 +2647,9 @@ def _self_check_recent_performance() -> Optional[Dict]:
         return None
     wins = sum(1 for r in outcomes if r > 0)
     cum_r = sum(outcomes)
+    gross_win_r = sum(r for r in outcomes if r > 0)
+    gross_loss_r = abs(sum(r for r in outcomes if r < 0))
+    profit_factor = round(gross_win_r / gross_loss_r, 2) if gross_loss_r > 0 else None
     # current losing streak, most-recent-first
     streak = 0
     for r in outcomes:
@@ -2153,6 +2660,7 @@ def _self_check_recent_performance() -> Optional[Dict]:
     return {
         "n": len(outcomes), "wins": wins, "win_rate": round(wins / len(outcomes) * 100, 1),
         "cum_r": round(cum_r, 2), "avg_r": round(cum_r / len(outcomes), 3),
+        "profit_factor": profit_factor,
         "current_losing_streak": streak,
     }
 
@@ -2773,9 +3281,10 @@ button{font-family:inherit;}
 .tag{font-weight:700;letter-spacing:.03em;}
 .tag.bullish,.tag.strong,.tag.high,.tag.optimal,.tag.positive{color:var(--lime);}
 .tag.medium{color:var(--amber);}
+.tag.bearish{color:var(--coral);}
+.tag.neutral{color:var(--text-mid);}
 
 .brain-row{display:flex;align-items:center;gap:14px;margin-bottom:10px;}
-.model-wave-canvas{width:100%;height:64px;display:block;margin-bottom:10px;border-radius:8px;}
 .brain-icon{width:46px;height:46px;flex-shrink:0;display:grid;place-items:center;border-radius:50%;
   background:radial-gradient(circle at 35% 30%,rgba(180,99,255,.35),rgba(180,99,255,.04));}
 .brain-icon svg{width:26px;height:26px;stroke:var(--violet);fill:none;stroke-width:1.4;
@@ -2785,6 +3294,64 @@ button{font-family:inherit;}
 .perf-cell-value{font-family:var(--font-display);font-size:14px;font-weight:600;margin-top:2px;color:var(--text-hi);}
 
 .risk-grid{display:flex;flex-direction:column;gap:11px;margin-top:4px;}
+
+/* ================================================================
+   [REAL TABS ADD] Autopilot · Portfolio Vault · Backtest Engine ·
+   System Settings — these used to just toast "queued for next build
+   phase". Layout mirrors the existing .dash-grid panel language so
+   nothing feels bolted-on.
+   ================================================================ */
+.tab-view{max-width:820px;margin:0 auto;padding:18px 16px 32px;display:flex;flex-direction:column;gap:16px;}
+.tab-view[hidden]{display:none;}
+.tab-empty{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:38px 20px;color:var(--text-mid);font-size:12.5px;line-height:1.6;}
+.tab-empty svg{width:30px;height:30px;stroke:var(--text-dim);fill:none;stroke-width:1.6;}
+.tab-empty .connect-cta{margin-top:4px;background:var(--lime);color:#04240a;border:none;border-radius:9px;padding:9px 18px;font-weight:700;font-size:12px;font-family:var(--font-body);cursor:pointer;}
+
+.act-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;}
+.act-btn{flex:1;min-width:132px;border-radius:10px;padding:13px 14px;font-family:var(--font-body);font-weight:700;
+  font-size:13px;letter-spacing:.02em;border:1px solid var(--panel-border);background:rgba(255,255,255,.03);
+  color:var(--text-hi);cursor:pointer;transition:filter .15s,transform .1s;}
+.act-btn:active{transform:scale(.98);}
+.act-btn.primary{background:var(--lime);color:#04240a;border-color:var(--lime);}
+.act-btn.warn{background:rgba(255,176,32,.12);color:var(--amber);border-color:rgba(255,176,32,.4);}
+.act-btn.danger{background:rgba(255,79,109,.12);color:var(--coral);border-color:rgba(255,79,109,.4);}
+.act-btn:disabled{opacity:.4;cursor:not-allowed;}
+.act-btn .sub{display:block;font-size:9.5px;font-weight:500;opacity:.75;margin-top:2px;letter-spacing:.02em;text-transform:none;}
+
+.status-banner{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;font-size:12.5px;font-weight:600;}
+.status-banner.ok{background:rgba(157,255,31,.08);border:1px solid rgba(157,255,31,.3);color:var(--lime-soft);}
+.status-banner.paused{background:rgba(255,176,32,.1);border:1px solid rgba(255,176,32,.35);color:var(--amber);}
+.status-banner.danger{background:rgba(255,79,109,.1);border:1px solid rgba(255,79,109,.35);color:var(--coral);}
+.status-dot{width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor;flex:none;}
+
+.settings-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:12px;}
+.settings-row:last-child{border-bottom:none;}
+.settings-row .k{color:var(--text-mid);}
+.settings-row .v{color:var(--text-hi);font-weight:600;font-family:var(--font-display);font-size:11.5px;text-align:right;}
+.settings-row .v.on{color:var(--lime);} .settings-row .v.off{color:var(--text-dim);} .settings-row .v.danger{color:var(--coral);}
+.signal-tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;margin:2px 3px 0 0;background:rgba(157,255,31,.1);color:var(--lime-soft);border:1px solid rgba(157,255,31,.25);}
+.signal-tag.off{background:rgba(255,255,255,.03);color:var(--text-dim);border-color:var(--panel-border);}
+
+.stat-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.stat-mini{background:rgba(255,255,255,.02);border:1px solid var(--panel-border);border-radius:10px;padding:11px 12px;}
+.stat-mini .lbl{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-dim);margin-bottom:4px;}
+.stat-mini .val{font-family:var(--font-display);font-size:16px;font-weight:700;color:var(--text-hi);}
+.stat-mini .val.pos{color:var(--lime);} .stat-mini .val.neg{color:var(--coral);}
+
+.equity-wrap{width:100%;height:110px;margin-top:8px;}
+.equity-wrap svg{width:100%;height:100%;}
+
+.confirm-overlay{position:fixed;inset:0;background:rgba(2,4,9,.72);backdrop-filter:blur(4px);z-index:80;
+  display:flex;align-items:flex-end;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s;}
+.confirm-overlay.show{opacity:1;pointer-events:auto;}
+.confirm-card{width:100%;max-width:420px;background:var(--space-800);border:1px solid var(--panel-border-strong);
+  border-radius:18px 18px 0 0;padding:22px 20px calc(22px + env(safe-area-inset-bottom,0px));
+  transform:translateY(16px);transition:transform .25s cubic-bezier(.16,.84,.44,1);}
+.confirm-overlay.show .confirm-card{transform:translateY(0);}
+.confirm-title{font-family:var(--font-display);font-size:15px;font-weight:700;color:var(--text-hi);margin-bottom:8px;}
+.confirm-body{font-size:12.5px;color:var(--text-mid);line-height:1.55;margin-bottom:18px;}
+.confirm-actions{display:flex;gap:10px;}
+.confirm-actions .act-btn{margin-top:0;}
 .risk-row{display:flex;align-items:center;justify-content:space-between;font-size:11.5px;}
 .risk-row span:first-child{display:flex;align-items:center;gap:7px;color:var(--text-mid);}
 .risk-dot{width:6px;height:6px;border-radius:50%;background:var(--cyan);box-shadow:0 0 6px var(--cyan);}
@@ -2850,7 +3417,7 @@ button{font-family:inherit;}
 .signals-total strong{font-family:var(--font-display);color:var(--lime);font-size:13px;}
 
 .orb-stage{position:relative;min-height:300px;display:grid;place-items:center;border-radius:var(--radius);
-  background:radial-gradient(ellipse 70% 60% at 50% 50%,rgba(157,255,31,.05),transparent 70%);}
+  background:radial-gradient(ellipse 75% 65% at 50% 48%,rgba(157,255,31,.16),rgba(47,228,255,.07) 45%,transparent 72%);}
 .orb-stage canvas{position:absolute;inset:0;width:100%;height:100%;}
 .orb-fallback{width:200px;height:200px;border-radius:50%;position:relative;
   background:radial-gradient(circle at 38% 34%,rgba(157,255,31,.55),rgba(10,20,10,0) 62%);}
@@ -2861,7 +3428,12 @@ button{font-family:inherit;}
   animation:spin 7s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
 
-.worldmap-canvas{width:100%;aspect-ratio:240/108;display:block;border-radius:8px;}
+.network-svg{width:100%;display:block;}
+.network-line{stroke:rgba(47,228,255,.4);stroke-width:1;stroke-dasharray:4 3;animation:dashFlow 3s linear infinite;}
+.network-node{fill:var(--cyan);filter:drop-shadow(0 0 4px rgba(47,228,255,.85));}
+.network-node.alt{fill:var(--lime);filter:drop-shadow(0 0 4px rgba(157,255,31,.85));}
+.worldmap-wrap{width:100%;aspect-ratio:240/110;position:relative;}
+.worldmap-wrap canvas{width:100%;height:100%;display:block;}
 @keyframes dashFlow{to{stroke-dashoffset:-14;}}
 
 .sentiment-block{margin-top:14px;}
@@ -3172,7 +3744,7 @@ button{font-family:inherit;}
   </header>
 
   <!-- ============================== MAIN GRID ============================== -->
-  <main class="dash-grid">
+  <main class="dash-grid tab-view" id="view-dashboard">
 
     <!-- ---------------- LEFT COLUMN ---------------- -->
     <section class="col-left">
@@ -3198,15 +3770,16 @@ button{font-family:inherit;}
       <div class="panel" id="panel-confidence">
         <div class="panel-head">
           <span class="panel-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.6"/><circle cx="19" cy="6" r="1.6"/><circle cx="5" cy="18" r="1.6"/><circle cx="19" cy="18" r="1.6"/><line x1="12" y1="12" x2="5" y2="6"/><line x1="12" y1="12" x2="19" y2="6"/><line x1="12" y1="12" x2="5" y2="18"/><line x1="12" y1="12" x2="19" y2="18"/></svg>AI Confidence Matrix</span>
+          <span class="count-pill" data-modepill id="confidenceMode">Demo</span>
         </div>
         <div class="big-gauge-wrap">
           <svg viewBox="0 0 120 120" class="big-gauge gauge-ring">
             <circle cx="60" cy="60" r="50" class="gauge-bg"/>
-            <circle cx="60" cy="60" r="50" class="gauge-fg" data-pct="92.7"/>
+            <circle cx="60" cy="60" r="50" class="gauge-fg" data-pct="92.7" id="confGaugeFg"/>
           </svg>
-          <div class="big-gauge-label"><span class="big-gauge-pct">92.7%</span><span class="big-gauge-tag">AI Extreme High</span></div>
+          <div class="big-gauge-label"><span class="big-gauge-pct" id="confGaugePct">92.7%</span><span class="big-gauge-tag" id="confGaugeTag">AI Extreme High</span></div>
         </div>
-        <div class="confidence-list">
+        <div class="confidence-list" id="confidenceList">
           <div class="confidence-row"><span>Market Sentiment</span><span class="tag bullish">BULLISH</span></div>
           <div class="confidence-row"><span>Volatility Index</span><span class="tag medium">MEDIUM</span></div>
           <div class="confidence-row"><span>Trend Strength</span><span class="tag strong">VERY STRONG</span></div>
@@ -3219,29 +3792,32 @@ button{font-family:inherit;}
       <div class="panel" id="panel-model-perf">
         <div class="panel-head">
           <span class="panel-title"><svg viewBox="0 0 24 24"><path d="M9 3a4 4 0 0 0-3.5 6A4 4 0 0 0 6 16.5 3.5 3.5 0 0 0 9.5 20 3 3 0 0 0 12 18.5V6A3.5 3.5 0 0 0 9 3Z"/><path d="M15 3a4 4 0 0 1 3.5 6A4 4 0 0 1 18 16.5a3.5 3.5 0 0 1-3.5 3.5A3 3 0 0 1 12 18.5V6A3.5 3.5 0 0 1 15 3Z"/></svg>AI Model Performance</span>
+          <span class="count-pill" data-modepill id="perfMode">Demo</span>
         </div>
-        <canvas id="modelWaveCanvas" class="model-wave-canvas"></canvas>
         <div class="brain-row">
-          <div><div class="stat-hero" style="font-size:26px;color:var(--lime)" id="modelAccuracyNum">98.6%</div><div class="mini-stat-label">Model Accuracy</div></div>
+          <div class="brain-icon"><svg viewBox="0 0 24 24"><path d="M9 3a4 4 0 0 0-3.5 6A4 4 0 0 0 6 16.5 3.5 3.5 0 0 0 9.5 20 3 3 0 0 0 12 18.5V6A3.5 3.5 0 0 0 9 3Z"/><path d="M15 3a4 4 0 0 1 3.5 6A4 4 0 0 1 18 16.5a3.5 3.5 0 0 1-3.5 3.5A3 3 0 0 1 12 18.5V6A3.5 3.5 0 0 1 15 3Z"/></svg></div>
+          <div><div class="stat-hero" style="font-size:22px;color:var(--violet)" id="perfWinRateHero">98.6%</div><div class="mini-stat-label" id="perfWinRateLabel">Model Accuracy</div></div>
         </div>
         <div class="perf-grid">
-          <div><div class="perf-cell-label">Total Predictions</div><div class="perf-cell-value">24,856</div></div>
-          <div><div class="perf-cell-label">Win Rate</div><div class="perf-cell-value">78.3%</div></div>
-          <div><div class="perf-cell-label">Sharpe Ratio</div><div class="perf-cell-value">2.71</div></div>
-          <div><div class="perf-cell-label">Profit Factor</div><div class="perf-cell-value">3.89</div></div>
+          <div><div class="perf-cell-label">Closed Trades</div><div class="perf-cell-value" id="perfTrades">24,856</div></div>
+          <div><div class="perf-cell-label">Win Rate</div><div class="perf-cell-value" id="perfWinRate2">78.3%</div></div>
+          <div><div class="perf-cell-label">Cumulative R</div><div class="perf-cell-value" id="perfCumR">2.71</div></div>
+          <div><div class="perf-cell-label">Profit Factor</div><div class="perf-cell-value" id="perfProfitFactor">3.89</div></div>
         </div>
       </div>
 
       <div class="panel" id="panel-risk">
         <div class="panel-head">
           <span class="panel-title"><svg viewBox="0 0 24 24"><path d="M12 2 L20 5.5 V11 C20 16.5 16.5 20.5 12 22 C7.5 20.5 4 16.5 4 11 V5.5 Z"/></svg>Risk Management Suite</span>
+          <span class="count-pill" data-modepill>Demo</span>
         </div>
         <div class="risk-grid">
-          <div class="risk-row"><span><span class="risk-dot"></span>Max Drawdown</span><strong>12.4%</strong></div>
-          <div class="risk-row"><span><span class="risk-dot"></span>VaR (95%)</span><strong>$2,341.32</strong></div>
-          <div class="risk-row"><span><span class="risk-dot"></span>Exposure</span><strong>35.6%</strong></div>
-          <div class="risk-row"><span><span class="risk-dot"></span>Leverage</span><strong>10x Isolated</strong></div>
+          <div class="risk-row"><span><span class="risk-dot"></span>Max Drawdown</span><strong id="risk-maxdd">—</strong></div>
+          <div class="risk-row"><span><span class="risk-dot"></span>Exposure</span><strong id="risk-exposure">—</strong></div>
+          <div class="risk-row"><span><span class="risk-dot"></span>Open Risk (to SL)</span><strong id="risk-openrisk">—</strong></div>
+          <div class="risk-row"><span><span class="risk-dot"></span>Leverage</span><strong id="risk-leverage">—</strong></div>
         </div>
+        <div class="risk-note" id="risk-note" style="font-size:9.5px;color:var(--text-dim);margin-top:9px;line-height:1.4;"></div>
       </div>
 
       <div class="panel" id="panel-syspulse">
@@ -3333,7 +3909,7 @@ button{font-family:inherit;}
 
         <div class="panel">
           <div class="panel-head"><span class="panel-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><line x1="3" y1="12" x2="21" y2="12"/></svg>Market Intelligence</span></div>
-          <canvas id="worldMapCanvas" class="worldmap-canvas"></canvas>
+          <div class="worldmap-wrap"><canvas id="worldMapCanvas"></canvas></div>
           <div class="sentiment-block">
             <div class="sentiment-head"><span>Global Market Sentiment</span><span class="sentiment-tag">Bullish 73.6%</span></div>
             <div class="bar-track"><div class="bar-fill" id="bar-sentiment" data-pct="73.6"></div></div>
@@ -3483,6 +4059,62 @@ button{font-family:inherit;}
 
   </main>
 
+  <!-- ================= AUTOPILOT ================= -->
+  <section class="tab-view" id="view-autopilot" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>Autopilot</span>
+        <span class="count-pill" data-modepill id="autopilotMode">Demo</span>
+      </div>
+      <div id="autopilotBody"><div class="tab-empty">Loading…</div></div>
+    </div>
+  </section>
+
+  <!-- ================= PORTFOLIO VAULT ================= -->
+  <section class="tab-view" id="view-vault" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title"><svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M3 10h18M8 3.5h8"/></svg>Portfolio Vault</span>
+        <span class="count-pill" data-modepill id="vaultMode">Demo</span>
+      </div>
+      <div id="vaultBody"><div class="tab-empty">Loading…</div></div>
+    </div>
+  </section>
+
+  <!-- ================= BACKTEST ENGINE ================= -->
+  <section class="tab-view" id="view-backtest" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>Backtest Engine</span>
+        <span class="count-pill" data-modepill id="backtestMode">Demo</span>
+      </div>
+      <div id="backtestBody"><div class="tab-empty">Loading…</div></div>
+    </div>
+  </section>
+
+  <!-- ================= SYSTEM SETTINGS ================= -->
+  <section class="tab-view" id="view-settings" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>System Settings</span>
+        <span class="count-pill" data-modepill id="settingsMode">Demo</span>
+      </div>
+      <div id="settingsBody"><div class="tab-empty">Loading…</div></div>
+    </div>
+  </section>
+
+  <!-- ================= CONFIRM MODAL (shared by any destructive action) ================= -->
+  <div class="confirm-overlay" id="confirmOverlay">
+    <div class="confirm-card">
+      <div class="confirm-title" id="confirmTitle">Are you sure?</div>
+      <div class="confirm-body" id="confirmBody"></div>
+      <div class="confirm-actions">
+        <button class="act-btn" id="confirmCancelBtn" type="button" style="flex:1;">Cancel</button>
+        <button class="act-btn danger" id="confirmOkBtn" type="button" style="flex:1;">Confirm</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ============================== BOTTOM NAV ============================== -->
   <nav class="bottom-nav">
     <button class="nav-arrow" id="navLeft" aria-label="scroll left"><svg viewBox="0 0 24 24"><polyline points="15,6 9,12 15,18"/></svg></button>
@@ -3588,6 +4220,7 @@ function clearLiveConfig(){
   try{ localStorage.removeItem(LIVE_STORAGE_KEY); }catch(e){}
   updateDataModeBadge();
   loadCandles(chartState.tf);
+  renderRiskPanel();
   showToast('Disconnected — back to simulated data.');
 }
 function updateDataModeBadge(){
@@ -3613,12 +4246,16 @@ async function liveFetch(path){
 }
 
 const _lastLiveTickerPrice = {};
+const LIVECACHE = { status:null, positions:null, rawPositions:null, balance:null, config:null, marks:null, cycles:null, stats:null };
+
 async function pollLive(){
   if(!LIVE.enabled) return;
-  const [statusJ, posJ, trdJ, balJ, cfgJ, rejJ, execJ, sysJ, tickJ] = await Promise.all([
+  const [statusJ, posJ, trdJ, balJ, cfgJ, rejJ, execJ, sysJ, tickJ, oracleJ, perfJ, statsTrdJ] = await Promise.all([
     liveFetch('/status'), liveFetch('/positions'), liveFetch('/trades?limit=8'), liveFetch('/balance'),
     liveFetch('/config'), liveFetch('/rejections?limit=6'), liveFetch('/execution-stats'), liveFetch('/system-health'),
-    liveFetch('/mark-prices?symbols='+TICKERS.join(','))
+    liveFetch('/mark-prices?symbols='+TICKERS.join(',')),
+    liveFetch('/ai-oracle'), liveFetch('/performance-summary'),
+    liveFetch('/trades?limit=500')
   ]);
   if(tickJ && tickJ.prices){
     TICKERS.forEach(sym=>{
@@ -3644,19 +4281,302 @@ async function pollLive(){
     state.balance = balJ.balance;
     setTextFlash(document.getElementById('stat-balance'), fmtUSD(state.balance,2,'$ '), 1);
   }
+  LIVECACHE.status = statusJ; LIVECACHE.balance = balJ; LIVECACHE.config = cfgJ;
+  let marks = {};
   if(posJ && Array.isArray(posJ.positions)){
     const bases = [...new Set(posJ.positions.map(p=>(p.symbol||'').replace(/USDT?$/i,'').toUpperCase()).filter(Boolean))];
     const markJ = bases.length ? await liveFetch('/mark-prices?symbols='+encodeURIComponent(bases.join(','))) : null;
-    const marks = (markJ && markJ.prices) || {};
+    marks = (markJ && markJ.prices) || {};
     positions = posJ.positions.map(p=>mapLivePosition(p, marks));
     renderPositions();
+    LIVECACHE.rawPositions = posJ.positions; LIVECACHE.marks = marks;
   }
   if(trdJ && Array.isArray(trdJ.trades)){ trades = trdJ.trades.slice(0,8).map(mapLiveTrade); renderTrades(); }
+  if(statsTrdJ && Array.isArray(statsTrdJ.trades)){
+    // API returns newest-first; reconstructTradeCycles needs oldest-first.
+    const cycles = reconstructTradeCycles(statsTrdJ.trades.slice().reverse());
+    LIVECACHE.cycles = cycles; LIVECACHE.stats = computeBacktestStats(cycles);
+    renderRiskPanel();
+    if(document.getElementById('view-backtest') && !document.getElementById('view-backtest').hidden) renderBacktestTab();
+  }
   if(statusJ) document.getElementById('posCount').textContent = (statusJ.open_positions ?? positions.length) + ' Active Positions';
   if(rejJ && Array.isArray(rejJ.rejections)){ gatekeeperLog = rejJ.rejections.map(mapLiveRejection); renderGatekeeper(); }
   if(execJ) renderExecutionStats(execJ);
   if(sysJ) renderSystemHealth(sysJ);
   if(cfgJ) renderEngineChips(cfgJ);
+  if(oracleJ) renderAiOracle(oracleJ);
+  if(perfJ) renderPerformance(perfJ);
+  // These four react to data that may have arrived above even if their own
+  // tab isn't the active view yet — cheap to keep current in the background
+  // so switching tabs shows fresh numbers immediately, not a stale snapshot.
+  if(document.getElementById('view-autopilot') && !document.getElementById('view-autopilot').hidden) renderAutopilotTab();
+  if(document.getElementById('view-vault') && !document.getElementById('view-vault').hidden) renderVaultTab();
+  if(document.getElementById('view-settings') && !document.getElementById('view-settings').hidden) renderSettingsTab();
+}
+function renderRiskPanel(){
+  const dd = document.getElementById('risk-maxdd'), exp = document.getElementById('risk-exposure'),
+        risk = document.getElementById('risk-openrisk'), lev = document.getElementById('risk-leverage'),
+        note = document.getElementById('risk-note');
+  if(!LIVE.enabled){
+    dd.textContent='12.4%'; exp.textContent='35.6%'; risk.textContent='$2,341.32'; lev.textContent='10x Isolated';
+    if(note) note.textContent = 'Illustrative — connect your live bot for real numbers.';
+    return;
+  }
+  const rawPos = LIVECACHE.rawPositions || [], marks = LIVECACHE.marks || {}, bal = LIVECACHE.balance && LIVECACHE.balance.balance;
+  const openRisk = computeOpenRiskUSD(rawPos);
+  const exposureUSD = computeExposureUSD(rawPos, marks);
+  risk.textContent = fmtUSD(openRisk, 2, '$ ');
+  exp.textContent = (bal && bal>0) ? ((exposureUSD/bal)*100).toFixed(1)+'%' : (exposureUSD>0 ? fmtUSD(exposureUSD,0,'$ ') : '—');
+  if(LIVECACHE.stats){
+    dd.textContent = fmtUSD(LIVECACHE.stats.maxDrawdownAbs, 2, '$ ') + ' (realized)';
+  } else { dd.textContent = rawPos.length || (LIVECACHE.cycles && LIVECACHE.cycles.length) ? '$ 0.00 (realized)' : 'No closed trades yet'; }
+  lev.textContent = 'Not tracked by backend';
+  if(note) note.textContent = 'Max drawdown = peak-to-trough on REALIZED pnl from your trade log (not full account-equity history, which isn\'t stored). Leverage isn\'t recorded per-position by this backend.';
+}
+
+/* ================================================================
+   [REAL TABS ADD] Autopilot · Portfolio Vault · Backtest Engine ·
+   System Settings — shared confirm modal + control-action caller,
+   then one render function per tab.
+   ================================================================ */
+function confirmAction(title, body, onConfirm){
+  const overlay = document.getElementById('confirmOverlay');
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmBody').textContent = body;
+  overlay.classList.add('show');
+  const okBtn = document.getElementById('confirmOkBtn'), cancelBtn = document.getElementById('confirmCancelBtn');
+  function cleanup(){ overlay.classList.remove('show'); okBtn.removeEventListener('click', onOk); cancelBtn.removeEventListener('click', onCancel); overlay.removeEventListener('click', onBackdrop); }
+  function onOk(){ cleanup(); onConfirm(); }
+  function onCancel(){ cleanup(); }
+  function onBackdrop(e){ if(e.target===overlay) onCancel(); }
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  overlay.addEventListener('click', onBackdrop);
+}
+async function callControl(action){
+  if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
+  try{
+    const res = await fetch(LIVE.baseUrl + '/control/' + encodeURIComponent(LIVE.key) + '/' + action, { cache:'no-store' });
+    const body = await res.json().catch(()=>({}));
+    if(!res.ok){
+      showToast('Action failed: ' + (body.error || res.status) + (res.status===403 ? ' — if APEX_CONTROL_PASSWORD is set separately on your bot, your connect key won\'t match it.' : ''));
+      return null;
+    }
+    return body;
+  }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
+}
+
+function renderAutopilotTab(){
+  const body = document.getElementById('autopilotBody');
+  if(!LIVE.enabled){
+    body.innerHTML = '<div class="tab-empty"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>'+
+      'Connect your live bot to control it from here — pause/resume entries, arm the kill switch, or close every open position.'+
+      '<button class="connect-cta" type="button" id="autopilotConnectCta">Connect Now</button></div>';
+    document.getElementById('autopilotConnectCta').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
+    return;
+  }
+  const cfg = LIVECACHE.config || {};
+  const paused = !!cfg.paused, killed = !!cfg.kill_switch_active, live = !!cfg.live_mode;
+  const cb = cfg.circuit_breaker || {};
+  let bannerClass='ok', bannerText = live ? 'LIVE — placing real orders' : 'DRY RUN — no real orders sent';
+  if(paused){ bannerClass='paused'; bannerText='PAUSED — no new entries will be taken'; }
+  if(killed){ bannerClass='danger'; bannerText='KILL SWITCH ARMED — all new entries blocked'; }
+  body.innerHTML =
+    '<div class="status-banner '+bannerClass+'"><span class="status-dot"></span>'+bannerText+'</div>'+
+    '<div class="act-row">'+
+      '<button class="act-btn primary" id="btnResume" '+(!paused?'disabled':'')+'>Resume Trading<span class="sub">Allow new entries again</span></button>'+
+      '<button class="act-btn warn" id="btnPause" '+(paused?'disabled':'')+'>Pause<span class="sub">Block new entries · open trades keep running</span></button>'+
+    '</div>'+
+    '<div class="act-row">'+
+      '<button class="act-btn '+(killed?'primary':'danger')+'" id="btnKill">'+(killed?'Disarm Kill Switch':'Arm Kill Switch')+'<span class="sub">'+(killed?'Resume normal operation':'Blocks new entries until manually reset')+'</span></button>'+
+      '<button class="act-btn danger" id="btnCloseAll">Close All Positions<span class="sub">Market-close every open trade now</span></button>'+
+    '</div>'+
+    '<div class="panel" style="padding:14px;margin-top:2px;">'+
+      '<div class="settings-row"><span class="k">Circuit Breaker</span><span class="v '+(cb.tripped?'danger':'on')+'">'+(cb.tripped?'TRIPPED':'Clear')+'</span></div>'+
+      '<div class="settings-row"><span class="k">Consecutive Losses</span><span class="v">'+(cb.consecutive_losses ?? '—')+' / '+(cb.max_consecutive_losses ?? '—')+'</span></div>'+
+      '<div class="settings-row"><span class="k">Mode</span><span class="v '+(live?'danger':'on')+'">'+(live?'LIVE (real orders)':'DRY RUN (simulated)')+'</span></div>'+
+    '</div>';
+  document.getElementById('btnPause').onclick = ()=> confirmAction('Pause trading?',
+    'No new entries will be taken until you resume. Positions already open keep running with their normal SL/TP/trailing logic — pausing does not touch them.',
+    async ()=>{ const r = await callControl('pause'); if(r){ showToast('Paused.'); await pollLive(); renderAutopilotTab(); } });
+  document.getElementById('btnResume').onclick = async ()=>{
+    const r = await callControl('resume'); if(r){ showToast('Resumed — new entries allowed again.'); await pollLive(); renderAutopilotTab(); }
+  };
+  document.getElementById('btnKill').onclick = ()=>{
+    if(killed){
+      callControl('kill-switch/reset').then(r=>{ if(r){ showToast('Kill switch disarmed.'); pollLive().then(renderAutopilotTab); } });
+    } else {
+      confirmAction('Arm the kill switch?',
+        'Blocks every new entry immediately and stays armed until you manually disarm it — meant for "something is wrong, stop everything until I\'ve looked at it". It does NOT close positions already open; use Close All for that separately.',
+        async ()=>{ const r = await callControl('kill-switch'); if(r){ showToast('Kill switch armed.'); await pollLive(); renderAutopilotTab(); } });
+    }
+  };
+  document.getElementById('btnCloseAll').onclick = ()=> confirmAction('Close ALL open positions?',
+    'Immediately market-closes every open position at whatever price is available right now — it does not wait for TP/SL levels, and this cannot be undone.',
+    async ()=>{ const r = await callControl('close-all'); if(r){ showToast('Close-all sent.'); await pollLive(); renderAutopilotTab(); } });
+}
+
+function renderVaultTab(){
+  const body = document.getElementById('vaultBody');
+  if(!LIVE.enabled){
+    body.innerHTML = '<div class="tab-empty"><svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M3 10h18M8 3.5h8"/></svg>'+
+      'Connect your live bot to see your real Delta account balance and position exposure here.'+
+      '<button class="connect-cta" type="button" id="vaultConnectCta">Connect Now</button></div>';
+    document.getElementById('vaultConnectCta').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
+    return;
+  }
+  const balJ = LIVECACHE.balance || {}, rawPos = LIVECACHE.rawPositions || [], marks = LIVECACHE.marks || {};
+  const bal = typeof balJ.balance === 'number' ? balJ.balance : null;
+  const exposureUSD = computeExposureUSD(rawPos, marks);
+  const rows = rawPos.map(p=>{
+    const base=(p.symbol||'').replace(/USDT?$/i,'').toUpperCase();
+    const px = marks[base]!=null ? marks[base] : p.entry_price;
+    const val = (px!=null && p.qty!=null) ? px*p.qty : null;
+    return '<div class="settings-row"><span class="k">'+(p.symbol||'—')+' · '+(p.direction||'—')+'</span><span class="v">'+(val!=null?fmtUSD(val,2,'$ '):'—')+'</span></div>';
+  }).join('') || '<div class="settings-row"><span class="k">No open positions</span><span class="v">—</span></div>';
+  body.innerHTML =
+    '<div class="stat-hero-label">Total Balance (USDT)</div>'+
+    '<div class="stat-hero">'+(bal!=null ? fmtUSD(bal,2,'$ ') : (balJ.error ? 'Unavailable' : '—'))+'</div>'+
+    (balJ.error ? '<div style="font-size:10.5px;color:var(--coral);margin-top:4px;">'+balJ.error+(balJ.cached_age_s?' · last good value '+Math.round(balJ.cached_age_s)+'s ago':'')+'</div>' : '')+
+    '<div class="stat-mini-grid" style="margin-top:16px;">'+
+      '<div class="stat-mini"><div class="lbl">Position Value</div><div class="val">'+fmtUSD(exposureUSD,2,'$ ')+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Exposure %</div><div class="val">'+((bal&&bal>0)?((exposureUSD/bal)*100).toFixed(1)+'%':'—')+'</div></div>'+
+    '</div>'+
+    '<div class="panel-title" style="margin:18px 0 4px;font-size:10.5px;">Open Position Value</div>'+
+    '<div class="panel" style="padding:12px 14px;">'+rows+'</div>';
+}
+
+function renderBacktestTab(){
+  const body = document.getElementById('backtestBody');
+  if(!LIVE.enabled){
+    body.innerHTML = '<div class="tab-empty"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>'+
+      'Connect your live bot to see real stats reconstructed from your actual trade log — win rate, profit factor, max drawdown, expectancy.'+
+      '<button class="connect-cta" type="button" id="backtestConnectCta">Connect Now</button></div>';
+    document.getElementById('backtestConnectCta').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
+    return;
+  }
+  const s = LIVECACHE.stats;
+  if(!s){
+    body.innerHTML = '<div class="tab-empty">No completed trades yet — this fills in once your bot has closed at least one full position.</div>';
+    return;
+  }
+  const pf = isFinite(s.profitFactor) ? s.profitFactor.toFixed(2) : '∞';
+  const curve = s.equityCurve, w = 300, h = 92;
+  const minV = Math.min(0, ...curve), maxV = Math.max(0, ...curve);
+  const range = (maxV - minV) || 1;
+  const pts = curve.map((v,i)=> (i/(Math.max(curve.length-1,1)))*w + ',' + (h - ((v-minV)/range)*h)).join(' ');
+  const zeroY = h - ((0-minV)/range)*h;
+  body.innerHTML =
+    '<div class="stat-mini-grid">'+
+      '<div class="stat-mini"><div class="lbl">Total Trades</div><div class="val">'+s.totalTrades+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Win Rate</div><div class="val '+(s.winRate>=50?'pos':'neg')+'">'+s.winRate.toFixed(1)+'%</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Profit Factor</div><div class="val '+(s.profitFactor>=1?'pos':'neg')+'">'+pf+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Expectancy / Trade</div><div class="val '+(s.expectancy>=0?'pos':'neg')+'">'+fmtUSD(s.expectancy,2,'$ ')+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Net Realized PnL</div><div class="val '+(s.netPnl>=0?'pos':'neg')+'">'+fmtUSD(s.netPnl,2,'$ ')+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Max Drawdown</div><div class="val neg">'+fmtUSD(s.maxDrawdownAbs,2,'$ ')+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Best Trade</div><div class="val pos">'+fmtUSD(s.bestTrade,2,'$ ')+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Worst Trade</div><div class="val neg">'+fmtUSD(s.worstTrade,2,'$ ')+'</div></div>'+
+    '</div>'+
+    '<div class="panel-title" style="margin:16px 0 2px;font-size:10.5px;">Realized Equity Curve (last '+curve.length+' closed trades)</div>'+
+    '<div class="equity-wrap"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none">'+
+      '<line x1="0" y1="'+zeroY+'" x2="'+w+'" y2="'+zeroY+'" stroke="rgba(255,255,255,.12)" stroke-width="1"/>'+
+      '<polyline points="'+pts+'" fill="none" stroke="'+(s.netPnl>=0?'#9dff1f':'#ff4f6d')+'" stroke-width="2"/>'+
+    '</svg></div>'+
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:10px;line-height:1.5;">Reconstructed from your real trades log (ENTRY paired with its EXIT_TP1/TP2/TP3/SL/MANUAL fills) — there\'s no stored pnl column, so every number here is computed from actual logged fill prices, not estimated. Only fully-closed positions count; anything still open is excluded.</div>';
+}
+
+function renderSettingsTab(){
+  const body = document.getElementById('settingsBody');
+  if(!LIVE.enabled){
+    body.innerHTML = '<div class="tab-empty"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9"/></svg>'+
+      'Connect your live bot to see its real configuration — active signals, safety switches, and feature flags.'+
+      '<button class="connect-cta" type="button" id="settingsConnectCta">Connect Now</button></div>';
+    document.getElementById('settingsConnectCta').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
+    return;
+  }
+  const c = LIVECACHE.config;
+  if(!c){ body.innerHTML = '<div class="tab-empty">Loading configuration…</div>'; return; }
+  const flag = (label,on) => '<div class="settings-row"><span class="k">'+label+'</span><span class="v '+(on?'on':'off')+'">'+(on?'ON':'OFF')+'</span></div>';
+  const active = new Set((c.active_signals||[]).map(s=>s.toUpperCase()));
+  const tags = (c.all_known_signals||c.active_signals||[]).map(s=>
+    '<span class="signal-tag '+(active.has(s.toUpperCase())?'':'off')+'">'+s+'</span>').join('') || '—';
+  const td = c.time_drift || {};
+  body.innerHTML =
+    '<div class="settings-row"><span class="k">Region</span><span class="v">'+(c.region||'—')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Mode</span><span class="v '+(c.live_mode?'danger':'on')+'">'+(c.live_mode?'LIVE':'DRY RUN')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Paused</span><span class="v '+(c.paused?'off':'on')+'">'+(c.paused?'YES':'NO')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Kill Switch</span><span class="v '+(c.kill_switch_active?'danger':'on')+'">'+(c.kill_switch_active?'ARMED':'clear')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Auto Bracket Orders</span><span class="v '+(c.auto_bracket_orders?'on':'off')+'">'+(c.auto_bracket_orders?'ON':'OFF')+'</span></div>'+
+    '<div class="settings-row"><span class="k">API Credentials</span><span class="v '+(c.api_credentials_ok?'on':'danger')+'">'+(c.api_credentials_ok?'OK':'CHECK')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Products Discovered</span><span class="v">'+(c.products_discovered ?? '—')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Clock Drift</span><span class="v '+((td.drift_ms==null||Math.abs(td.drift_ms)<1000)?'on':'danger')+'">'+(td.drift_ms!=null?Math.round(td.drift_ms)+'ms':'—')+'</span></div>'+
+    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Signal Tiers</div>'+
+    '<div>'+tags+'</div>'+
+    '<div class="panel-title" style="margin:18px 0 2px;font-size:10.5px;">Feature Flags</div>'+
+    flag('HFT Parallel Exits', c.hft_parallel_exits) +
+    flag('Predator Vision', c.predator_vision_enabled) +
+    flag('Risk-Based Sizing', c.risk_based_sizing) +
+    flag('Aggressive Exits', c.aggressive_exits_enabled) +
+    flag('Neural Syndicate', c.neural_syndicate_enabled) +
+    flag('Shock Entry Block', c.block_entries_during_shock) +
+    flag('Telegram Alerts', c.telegram_enabled) +
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">Read-only — this mirrors your bot\'s real /config response. Changing any of these requires an env var change + redeploy, not a toggle here, so nothing on this screen can silently drift from what\'s actually running.</div>';
+}
+
+function renderAiOracle(oracleJ){
+  const mode = document.getElementById('confidenceMode');
+  if(mode) mode.textContent = 'Live';
+  const symbols = oracleJ.symbols || {};
+  const keys = Object.keys(symbols);
+  const preferred = keys.find(k=>/BTC/i.test(k)) || keys[0];
+  const sym = preferred ? symbols[preferred] : null;
+
+  const pctEl = document.getElementById('confGaugePct'), tagEl = document.getElementById('confGaugeTag'),
+        fgEl = document.getElementById('confGaugeFg'), listEl = document.getElementById('confidenceList');
+  if(!sym || !sym.ok){
+    if(pctEl) pctEl.textContent = '—';
+    if(tagEl) tagEl.textContent = 'No oracle data yet';
+    if(listEl) listEl.innerHTML = '<div class="confidence-row"><span>AI Oracle</span><span class="tag neutral">WARMING UP</span></div>';
+    return;
+  }
+  const pct = Math.round(sym.confidence*100);
+  if(pctEl) pctEl.textContent = pct+'%';
+  if(fgEl){ fgEl.dataset.pct = pct; setGaugeProgress(fgEl, pct, 0); }
+  const tagClass = sym.consensus==='BULLISH' ? 'bullish' : sym.consensus==='BEARISH' ? 'bearish' : 'neutral';
+  if(tagEl) tagEl.textContent = (preferred||'') + ' · ' + sym.consensus;
+  if(listEl){
+    listEl.innerHTML = [
+      ['Consensus (' + (preferred||'') + ')', sym.consensus, tagClass],
+      ['Confidence', pct+'%', tagClass],
+      ['Data Source', sym.degraded_mode ? 'Quant-only (Gemini down)' : 'Gemini + Quant', sym.degraded_mode?'medium':'optimal'],
+      ['Models Agree', sym.agreement ? 'YES' : 'NO', sym.agreement?'positive':'medium'],
+      ['Rolling Accuracy', sym.rolling_accuracy_pct!=null ? sym.rolling_accuracy_pct+'%' : '— (needs more history)', 'neutral'],
+      ['Gemini Circuit', (oracleJ.circuit_breaker && oracleJ.circuit_breaker.state) || '—', (oracleJ.circuit_breaker && oracleJ.circuit_breaker.state==='closed') ? 'optimal' : 'medium'],
+    ].map(([k,v,cls])=>`<div class="confidence-row"><span>${k}</span><span class="tag ${cls}">${v}</span></div>`).join('');
+  }
+}
+function renderPerformance(perfJ){
+  const mode = document.getElementById('perfMode');
+  if(mode) mode.textContent = 'Live';
+  const o = perfJ.overall;
+  const heroEl = document.getElementById('perfWinRateHero'), labelEl = document.getElementById('perfWinRateLabel'),
+        tradesEl = document.getElementById('perfTrades'), wrEl = document.getElementById('perfWinRate2'),
+        cumREl = document.getElementById('perfCumR'), pfEl = document.getElementById('perfProfitFactor');
+  if(!o){
+    if(heroEl) heroEl.textContent = '—';
+    if(labelEl) labelEl.textContent = 'No closed trades yet';
+    if(tradesEl) tradesEl.textContent = '0';
+    if(wrEl) wrEl.textContent = '—';
+    if(cumREl) cumREl.textContent = '—';
+    if(pfEl) pfEl.textContent = '—';
+    return;
+  }
+  if(heroEl) heroEl.textContent = o.win_rate+'%';
+  if(labelEl) labelEl.textContent = 'Win Rate — last '+o.n+' closed trades';
+  if(tradesEl) tradesEl.textContent = o.n.toLocaleString();
+  if(wrEl) wrEl.textContent = o.win_rate+'%';
+  if(cumREl) cumREl.textContent = (o.cum_r>=0?'+':'')+o.cum_r+'R';
+  if(pfEl) pfEl.textContent = o.profit_factor!=null ? o.profit_factor : '—';
 }
 function mapLivePosition(p, marks){
   const base = (p.symbol||'').replace(/USDT?$/i,'').toUpperCase();
@@ -3673,6 +4593,78 @@ function mapLiveTrade(t){
 }
 function mapLiveRejection(r){
   return { time: new Date(r.timestamp).toLocaleTimeString('en-GB'), symbol:r.symbol||'—', reason:r.reason||'Blocked', detail:r.detail||'' };
+}
+
+/* ================================================================
+   REAL TRADE-CYCLE RECONSTRUCTION — shared by Risk panel (max
+   drawdown) and the Backtest Engine tab (all its stats).
+   The `trades` table logs raw ENTRY/EXIT_* fill events (symbol,
+   direction, event, qty, price, timestamp) — there is NO stored
+   pnl column anywhere in this backend. Rather than fabricate a
+   number, this walks the real event log chronologically per symbol
+   and pairs each ENTRY with the EXIT_* events that follow it
+   (handling partial closes across EXIT_TP1/TP2/TP3/SL/MANUAL), so
+   every figure downstream is reconstructed from real logged fills.
+   ================================================================ */
+function reconstructTradeCycles(rawTrades){
+  const bySymbol = {};
+  rawTrades.forEach(t => { (bySymbol[t.symbol] = bySymbol[t.symbol] || []).push(t); });
+  const cycles = [];
+  Object.keys(bySymbol).forEach(sym => {
+    const events = bySymbol[sym].slice().sort((a,b)=> new Date(a.timestamp) - new Date(b.timestamp));
+    let open = null;
+    events.forEach(ev => {
+      const type = (ev.event||'').toUpperCase();
+      if(type === 'ENTRY'){
+        // A fresh ENTRY while one is already "open" in our reconstruction
+        // means we never saw its closing fill(s) (e.g. history predates the
+        // ?limit window). That partial cycle is dropped rather than guessed
+        // at — honesty over false precision.
+        open = { symbol: sym, direction: (ev.direction||'BUY').toUpperCase(), entryPrice: ev.price, entryQty: ev.qty||0, entryTime: ev.timestamp, exitedQty: 0, realizedPnl: 0, lastExitTime: ev.timestamp };
+      } else if(open && ev.price != null && /EXIT|TP|SL|MANUAL/i.test(type)){
+        const dirMult = open.direction === 'BUY' ? 1 : -1;
+        const remaining = Math.max(open.entryQty - open.exitedQty, 0);
+        const partialQty = Math.min(ev.qty || remaining, remaining);
+        open.realizedPnl += dirMult * (ev.price - open.entryPrice) * partialQty;
+        open.exitedQty += partialQty;
+        open.lastExitTime = ev.timestamp;
+        if(open.exitedQty >= open.entryQty - 1e-9){ cycles.push(open); open = null; }
+      }
+    });
+    // An ENTRY still open with no matching exit is a currently-live position,
+    // correctly excluded — it isn't a completed cycle yet.
+  });
+  cycles.sort((a,b)=> new Date(a.lastExitTime) - new Date(b.lastExitTime));
+  return cycles;
+}
+function computeBacktestStats(cycles){
+  if(!cycles.length) return null;
+  const wins = cycles.filter(c=>c.realizedPnl>0), losses = cycles.filter(c=>c.realizedPnl<=0);
+  const grossProfit = wins.reduce((s,c)=>s+c.realizedPnl,0);
+  const grossLoss = Math.abs(losses.reduce((s,c)=>s+c.realizedPnl,0));
+  let running=0, peak=0, maxDD=0; const equityCurve=[];
+  cycles.forEach(c=>{ running+=c.realizedPnl; peak=Math.max(peak,running); maxDD=Math.max(maxDD,peak-running); equityCurve.push(running); });
+  return {
+    totalTrades: cycles.length, wins: wins.length, losses: losses.length,
+    winRate: (wins.length/cycles.length)*100,
+    profitFactor: grossLoss>0 ? grossProfit/grossLoss : (grossProfit>0 ? Infinity : 0),
+    expectancy: running/cycles.length, grossProfit, grossLoss, netPnl: running,
+    maxDrawdownAbs: maxDD, equityCurve,
+    bestTrade: cycles.reduce((m,c)=>Math.max(m,c.realizedPnl), -Infinity),
+    worstTrade: cycles.reduce((m,c)=>Math.min(m,c.realizedPnl), Infinity),
+  };
+}
+function computeOpenRiskUSD(rawPositions){
+  // Entry-to-SL distance × qty, summed — the risk capital actually committed
+  // at entry for each open position, per position sl already on record.
+  return rawPositions.reduce((sum,p)=> (p.sl!=null && p.entry_price!=null && p.qty!=null) ? sum + Math.abs(p.entry_price-p.sl)*p.qty : sum, 0);
+}
+function computeExposureUSD(rawPositions, marks){
+  return rawPositions.reduce((sum,p)=>{
+    const base=(p.symbol||'').replace(/USDT?$/i,'').toUpperCase();
+    const px = (marks && marks[base]!=null) ? marks[base] : p.entry_price;
+    return (px!=null && p.qty!=null) ? sum + px*p.qty : sum;
+  }, 0);
 }
 
 /* ================================================================
@@ -3710,7 +4702,15 @@ function bootSequence(){
    ================================================================ */
 function setGaugeProgress(shapeEl, pct, delay){
   if(!shapeEl || typeof shapeEl.getTotalLength !== 'function') return;
-  const len = shapeEl.getTotalLength();
+  // [BUGFIX] getTotalLength() throws (not just returns 0) on an SVG element
+  // that isn't currently rendered — e.g. its panel sits inside the Dashboard
+  // tab-view while a different tab (Autopilot/Vault/Backtest/Settings) is
+  // active. Background polling still updates these gauges' data-pct so they
+  //'re correct the instant the person switches back, but must not let a
+  // hidden gauge's failed measurement abort the rest of whatever render
+  // function called this (renderAiOracle, fetchRealFearGreed, etc).
+  let len;
+  try{ len = shapeEl.getTotalLength(); }catch(e){ return; }
   shapeEl.style.strokeDasharray = len;
   shapeEl.style.strokeDashoffset = len;
   setTimeout(()=>{
@@ -3746,8 +4746,36 @@ function initOrb(){
   camera.position.set(0,0,6.4);
 
   scene.add(new THREE.AmbientLight(0x223311, 1.1));
-  const l1 = new THREE.PointLight(0x9dff1f, 2.4, 20); l1.position.set(4,3,5); scene.add(l1);
-  const l2 = new THREE.PointLight(0x2fe4ff, 1.6, 20); l2.position.set(-4,-2,4); scene.add(l2);
+  const l1 = new THREE.PointLight(0x9dff1f, 3.0, 20); l1.position.set(4,3,5); scene.add(l1);
+  const l2 = new THREE.PointLight(0x2fe4ff, 2.1, 20); l2.position.set(-4,-2,4); scene.add(l2);
+  const l3 = new THREE.PointLight(0xb463ff, 1.6, 20); l3.position.set(0,-4,3); scene.add(l3);
+
+  // Self-contained "bloom" — a soft radial-gradient texture painted on an
+  // offscreen canvas at runtime, applied to additive-blended THREE.Sprites.
+  // Real bloom post-processing (UnrealBloomPass) needs extra three.js
+  // example modules on top of the single three.min.js CDN file; this gets
+  // the same glowing-halo look with zero extra network dependencies, so it
+  // can't silently fail if one more CDN script doesn't load.
+  function makeGlowTexture(hex){
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const ctx = c.getContext('2d');
+    const g = ctx.createRadialGradient(128,128,0,128,128,128);
+    g.addColorStop(0, hex+'ff'); g.addColorStop(0.35, hex+'55'); g.addColorStop(1, hex+'00');
+    ctx.fillStyle = g; ctx.fillRect(0,0,256,256);
+    return new THREE.CanvasTexture(c);
+  }
+  const glowSprites = [
+    { hex:'#9dff1f', scale:5.6, opacity:.55 },
+    { hex:'#2fe4ff', scale:4.0, opacity:.4 },
+    { hex:'#b463ff', scale:3.2, opacity:.35 },
+  ].map(def=>{
+    const mat = new THREE.SpriteMaterial({ map:makeGlowTexture(def.hex), transparent:true,
+      opacity:def.opacity, blending:THREE.AdditiveBlending, depthWrite:false });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(def.scale, def.scale, 1);
+    scene.add(sprite);
+    return sprite;
+  });
 
   const core = new THREE.Mesh(new THREE.IcosahedronGeometry(1.55,1),
     new THREE.MeshBasicMaterial({ color:0x9dff1f, wireframe:true, transparent:true, opacity:.62 }));
@@ -3803,6 +4831,8 @@ function initOrb(){
     apexMark.scale.setScalar(1 + Math.sin(performance.now()*.0016)*.06);
     rings.forEach(r=> r.rotation.z += r.userData.speed);
     particles.rotation.y += .0009;
+    const breathe = 1 + Math.sin(performance.now()*.0009)*.08;
+    glowSprites.forEach((s,i)=> s.scale.setScalar([5.6,4.0,3.2][i]*breathe));
     renderer.render(scene, camera);
   }
   animate();
@@ -4237,10 +5267,14 @@ const VOICE_COMMANDS = [
     reply:"Auto Pilot needs a confirmed toggle from the Autopilot module, Master. Opening it now.",
     action:()=>setActiveNav('autopilot') },
   { match:['close all positions','close positions'],
-    reply:"Closing positions is a live-trading action, Master — this console is a visual demo and will not execute it. Wire it to your /control/close-all endpoint when you're ready.",
-    action:()=>flashPanel('panel-positions') },
+    reply:"Opening Autopilot, Master — Close All Positions needs a manual confirmation there since it's irreversible.",
+    action:()=>setActiveNav('autopilot') },
   { match:['risk management report','risk report','risk'],
-    reply:"Max drawdown is 12.4%, VaR at 95% confidence is $2,341.32, exposure sits at 35.6%, leverage is 10x isolated.",
+    reply:()=>{
+      const g = id => (document.getElementById(id)||{}).textContent || '—';
+      return 'Max drawdown '+g('risk-maxdd')+', exposure '+g('risk-exposure')+', open risk to stop-loss '+g('risk-openrisk')+
+        ', leverage '+g('risk-leverage')+(LIVE.enabled ? '.' : ' — connect your live bot for real numbers, these are illustrative.');
+    },
     action:()=>flashPanel('panel-risk') },
   { match:['market news','news'],
     reply:"Latest: a large BTC whale transfer was flagged, and funding rates on BTC/USDT have turned positive.",
@@ -4294,7 +5328,7 @@ async function runCommand(text){
       if(res.ok && body.answer){ speakReply(body.answer); return; }
     }catch(e){ /* fall through to local reply below */ }
   }
-  const reply = cmd ? cmd.reply : "I didn't catch a known command, Master. Try one from the list below.";
+  const reply = cmd ? (typeof cmd.reply === 'function' ? cmd.reply() : cmd.reply) : "I didn't catch a known command, Master. Try one from the list below.";
   speakReply(reply);
 }
 
@@ -4343,9 +5377,21 @@ document.querySelectorAll('.say-item').forEach(el=>{
    NAV / TOAST
    ================================================================ */
 const NAV_LABELS = { dashboard:'Dashboard', strategy:'Strategy Lab', backtest:'Backtest Engine', vault:'Portfolio Vault', autopilot:'Autopilot', settings:'System Settings' };
+// [REAL TABS ADD] These 4 now have real content wired to real endpoints —
+// only 'strategy' still has no backend concept (the bot runs one signal
+// system, not multiple selectable strategies) so it keeps the honest toast.
+const REAL_TABS = ['dashboard','autopilot','vault','backtest','settings'];
+const TAB_RENDERERS = { autopilot: ()=>renderAutopilotTab(), vault: ()=>renderVaultTab(), backtest: ()=>renderBacktestTab(), settings: ()=>renderSettingsTab() };
 function setActiveNav(key){
+  if(!REAL_TABS.includes(key)){
+    showToast(NAV_LABELS[key] + ' module is queued for the next build phase, Master.');
+    return; // nothing real to switch to — leave the current view exactly as-is
+  }
   document.querySelectorAll('.nav-item').forEach(b=> b.classList.toggle('active', b.dataset.nav===key));
-  if(key !== 'dashboard') showToast(NAV_LABELS[key] + ' module is queued for the next build phase, Master.');
+  document.querySelectorAll('.tab-view').forEach(v=> v.hidden = (v.id !== 'view-'+key));
+  window.scrollTo({top:0, behavior:'instant'});
+  if(key === 'dashboard') initGaugesAndBars(); // re-sync gauges that silently skipped their draw while this tab was hidden
+  if(TAB_RENDERERS[key]) TAB_RENDERERS[key]();
 }
 document.querySelectorAll('.nav-item').forEach(b=> b.addEventListener('click', ()=> setActiveNav(b.dataset.nav)));
 document.getElementById('navLeft').addEventListener('click', ()=> document.getElementById('navItems').scrollBy({left:-220,behavior:'smooth'}));
@@ -4409,6 +5455,113 @@ document.addEventListener('click', (e)=>{
 });
 
 /* ================================================================
+   MARKET INTELLIGENCE — WORLD MAP
+   A genuine (if stylised, low-poly) world map instead of an abstract
+   node graph: hand-plotted continent silhouettes in equirectangular
+   space (0-100 x = -180..180 lon, 0-100 y = 90..-90 lat), rasterised
+   to a glowing dot grid on canvas. Point-in-polygon test per grid
+   cell, no external map libraries or network fetch needed — this
+   panel has to render even with the sandbox/deploy box offline.
+   ================================================================ */
+const WORLD_CONTINENTS = [
+  // North America
+  [[10,18],[14,11],[20,9],[26,12],[29,16],[28,22],[24,27],[19,32],[14,33],[10,29],[7,24],[8,20]],
+  // Greenland
+  [[28,7],[33,6],[35,9],[32,12],[28,11]],
+  // Central America land-bridge
+  [[16,32],[20,32],[19,36],[16,35]],
+  // South America
+  [[21,37],[26,36],[30,43],[29,53],[26,63],[23,59],[20,49],[19,41]],
+  // Europe
+  [[44,13],[50,10],[56,13],[57,18],[52,21],[46,20],[43,17]],
+  // Africa
+  [[45,21],[53,19],[58,27],[58,41],[54,53],[48,55],[43,47],[42,32]],
+  // Asia (mainland + Siberia)
+  [[55,9],[68,6],[84,10],[90,17],[86,23],[77,21],[71,27],[64,29],[58,25],[53,20]],
+  // India
+  [[61,29],[66,27],[68,34],[63,39],[59,34]],
+  // SE Asia / Indonesia
+  [[70,38],[78,37],[80,42],[74,44],[69,41]],
+  // Australia
+  [[77,57],[87,55],[91,61],[85,66],[77,64],[75,60]],
+  // UK/Ireland (tiny, own poly so it doesn't get swallowed by Europe gap)
+  [[41,14],[43,13],[43,16],[41,17]],
+  // Japan
+  [[87,20],[90,19],[91,24],[88,25]],
+];
+
+function _pointInPoly(x, y, poly){
+  let inside = false;
+  for(let i=0, j=poly.length-1; i<poly.length; j=i++){
+    const xi=poly[i][0], yi=poly[i][1], xj=poly[j][0], yj=poly[j][1];
+    const intersect = ((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/((yj-yi)||1e-9) + xi);
+    if(intersect) inside = !inside;
+  }
+  return inside;
+}
+function _isLand(xPct, yPct){
+  for(const poly of WORLD_CONTINENTS){ if(_pointInPoly(xPct, yPct, poly)) return true; }
+  return false;
+}
+// Precompute the land dot grid once — it never changes, only the paint
+// (glow pulse / colour) needs to run every frame.
+let _worldDots = null;
+function _buildWorldDots(cols, rows){
+  const dots = [];
+  for(let r=0; r<rows; r++){
+    for(let c=0; c<cols; c++){
+      const xPct = (c+0.5)/cols*100, yPct = (r+0.5)/rows*100;
+      if(_isLand(xPct, yPct)) dots.push({xPct, yPct, tw: Math.random()*Math.PI*2});
+    }
+  }
+  return dots;
+}
+function initWorldMap(){
+  const canvas = document.getElementById('worldMapCanvas');
+  if(!canvas) return;
+  const ctx = canvas.getContext('2d');
+  let w, h;
+  function resize(){
+    const rect = canvas.parentElement.getBoundingClientRect();
+    w = canvas.width = Math.max(1, Math.round(rect.width * (window.devicePixelRatio||1)));
+    h = canvas.height = Math.max(1, Math.round(rect.height * (window.devicePixelRatio||1)));
+    const cols = 70, rows = Math.round(cols * (h/w));
+    _worldDots = _buildWorldDots(cols, rows);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function colourFor(yPct){
+    // Vertical gradient echoing the reference art: cyan/blue near the
+    // poles, violet through the mid-latitudes, lime/amber near the
+    // equator — purely cosmetic, same palette as the rest of the shell.
+    if(yPct < 30) return '47,228,255';
+    if(yPct < 55) return '180,99,255';
+    if(yPct < 75) return '157,255,31';
+    return '255,176,32';
+  }
+  function frame(t){
+    if(!_worldDots){ requestAnimationFrame(frame); return; }
+    ctx.clearRect(0,0,w,h);
+    const dotR = Math.max(1, w/300);
+    for(const d of _worldDots){
+      const px = d.xPct/100*w, py = d.yPct/100*h;
+      const tw = 0.55 + 0.45*Math.sin(t*0.0012 + d.tw);
+      const rgb = colourFor(d.yPct);
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(${rgb},${(0.35+0.5*tw).toFixed(2)})`;
+      ctx.shadowColor = `rgba(${rgb},0.9)`;
+      ctx.shadowBlur = dotR*2.5;
+      ctx.arc(px, py, dotR, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ================================================================
    AMBIENT CINEMATIC BACKGROUND — drifting particle field + slow-moving
    nebula glow bands + occasional streak, running continuously behind
    every panel so the whole shell feels alive rather than static. Colour
@@ -4429,18 +5582,20 @@ function initStarfield(){
   resize();
   window.addEventListener('resize', resize);
 
-  const N = Math.round((innerWidth*innerHeight)/14000);
-  const stars = Array.from({length:Math.max(60,Math.min(N,160))}, ()=>({
-    x:Math.random(), y:Math.random(), z:0.3+Math.random()*0.9,
+  const N = Math.round((innerWidth*innerHeight)/3200);
+  const stars = Array.from({length:Math.max(180,Math.min(N,480))}, ()=>({
+    x:Math.random(), y:Math.random(), z:0.4+Math.random()*1.4,
     tw:Math.random()*Math.PI*2, spd:0.15+Math.random()*0.35,
+    big: Math.random() < 0.12,
   }));
   const blobs = [
-    {cx:.18,cy:.15,r:.34,hue:[157,255,31],spd:.011,ang:.2},
-    {cx:.85,cy:.1,r:.30,hue:[47,228,255],spd:.008,ang:2.1},
-    {cx:.12,cy:.88,r:.30,hue:[157,255,31],spd:.009,ang:4.0},
-    {cx:.88,cy:.85,r:.26,hue:[180,99,255],spd:.013,ang:5.3},
+    {cx:.18,cy:.15,r:.55,hue:[157,255,31],spd:.011,ang:.2},
+    {cx:.85,cy:.1, r:.5, hue:[47,228,255],spd:.008,ang:2.1},
+    {cx:.12,cy:.88,r:.5, hue:[157,255,31],spd:.009,ang:4.0},
+    {cx:.88,cy:.85,r:.46,hue:[180,99,255],spd:.013,ang:5.3},
+    {cx:.5, cy:.5, r:.62,hue:[47,228,255],spd:.006,ang:3.0},
   ];
-  let streak = null, nextStreakAt = performance.now() + 4000 + Math.random()*5000;
+  let streak = null, nextStreakAt = performance.now() + 2500 + Math.random()*3500;
   let killTint = 0; // 0 = brand palette, 1 = full coral warning tint
 
   function frame(t){
@@ -4454,7 +5609,8 @@ function initStarfield(){
       const rad = b.r * Math.max(w,h);
       const hue = killTint>0.05 ? [255,79,109] : b.hue;
       const g = ctx.createRadialGradient(bx,by,0,bx,by,rad);
-      g.addColorStop(0, `rgba(${hue[0]},${hue[1]},${hue[2]},${0.10*dpr})`);
+      g.addColorStop(0, `rgba(${hue[0]},${hue[1]},${hue[2]},${(0.38*dpr).toFixed(2)})`);
+      g.addColorStop(0.5, `rgba(${hue[0]},${hue[1]},${hue[2]},${(0.14*dpr).toFixed(2)})`);
       g.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = g;
       ctx.fillRect(0,0,w,h);
@@ -4462,12 +5618,17 @@ function initStarfield(){
 
     stars.forEach(s=>{
       s.tw += 0.02*s.spd;
-      const alpha = (0.35 + Math.sin(s.tw)*0.35) * s.z;
+      const alpha = (0.55 + Math.sin(s.tw)*0.4) * Math.min(1, s.z);
       const px = s.x*w, py = (s.y*h + t*0.006*s.spd) % h;
+      const r = (s.big ? 2.2 : 1.15) * dpr * s.z;
+      if(s.big){
+        ctx.shadowColor = 'rgba(210,235,255,.9)'; ctx.shadowBlur = r*3;
+      }
       ctx.beginPath();
-      ctx.fillStyle = `rgba(210,235,255,${Math.max(0,alpha).toFixed(2)})`;
-      ctx.arc(px, py, 1*dpr*s.z, 0, Math.PI*2);
+      ctx.fillStyle = `rgba(210,235,255,${Math.max(0,Math.min(1,alpha)).toFixed(2)})`;
+      ctx.arc(px, py, r, 0, Math.PI*2);
       ctx.fill();
+      ctx.shadowBlur = 0;
     });
 
     if(!streak && t > nextStreakAt){
@@ -4479,11 +5640,11 @@ function initStarfield(){
       const y2 = streak.y + Math.sin(streak.ang)*streak.len;
       const grad = ctx.createLinearGradient(streak.x,streak.y,x2,y2);
       grad.addColorStop(0,'rgba(234,255,176,0)');
-      grad.addColorStop(0.85,'rgba(234,255,176,.75)');
+      grad.addColorStop(0.85,'rgba(234,255,176,.9)');
       grad.addColorStop(1,'rgba(234,255,176,0)');
-      ctx.strokeStyle = grad; ctx.lineWidth = 1.4*dpr;
+      ctx.strokeStyle = grad; ctx.lineWidth = 2*dpr;
       ctx.beginPath(); ctx.moveTo(streak.x,streak.y); ctx.lineTo(x2,y2); ctx.stroke();
-      if(streak.len > streak.maxLen){ streak = null; nextStreakAt = t + 5000 + Math.random()*7000; }
+      if(streak.len > streak.maxLen){ streak = null; nextStreakAt = t + 3500 + Math.random()*5000; }
     }
 
     requestAnimationFrame(frame);
@@ -4492,122 +5653,46 @@ function initStarfield(){
 }
 
 /* ================================================================
-   MARKET INTELLIGENCE — colored dot-matrix world map (canvas). Six soft
-   elliptical landmass zones with noisy edges so it reads as a world map
-   rather than literal ellipses, each dot twinkling independently.
-   ================================================================ */
-function initWorldMap(){
-  const canvas = document.getElementById('worldMapCanvas');
-  if(!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const cssW = canvas.clientWidth || 240, cssH = canvas.clientHeight || 108;
-  const dpr = Math.min(window.devicePixelRatio||1, 2);
-  canvas.width = cssW*dpr; canvas.height = cssH*dpr;
-  ctx.scale(dpr,dpr);
-
-  const continents = [
-    {cx:.16,cy:.30,rx:.115,ry:.17,hue:[110,150,255]},   // North America
-    {cx:.235,cy:.68,rx:.06,ry:.175,hue:[196,214,74]},   // South America
-    {cx:.465,cy:.20,rx:.05,ry:.09,hue:[160,120,255]},   // Europe
-    {cx:.49,cy:.55,rx:.075,ry:.195,hue:[150,105,255]},  // Africa
-    {cx:.66,cy:.28,rx:.16,ry:.16,hue:[120,150,255]},    // Asia
-    {cx:.775,cy:.68,rx:.06,ry:.05,hue:[110,170,255]},   // Australia
-  ];
-  function hash(x,y){ const s = Math.sin(x*12.9898+y*78.233)*43758.5453; return s-Math.floor(s); }
-
-  const cols = 66, rows = 30, dots = [];
-  for(let r=0;r<rows;r++){
-    for(let c=0;c<cols;c++){
-      const x=c/cols, y=r/rows;
-      for(const cont of continents){
-        const dx=(x-cont.cx)/cont.rx, dy=(y-cont.cy)/cont.ry;
-        const d = Math.sqrt(dx*dx+dy*dy);
-        if(d < 0.88 + hash(c*.7,r*.7)*0.4){
-          dots.push({x,y,hue:cont.hue,tw:Math.random()*Math.PI*2,spd:.5+Math.random()*.7});
-          break;
-        }
-      }
-    }
-  }
-  (function frame(t){
-    ctx.clearRect(0,0,cssW,cssH);
-    dots.forEach(d=>{
-      d.tw += 0.016*d.spd;
-      const a = 0.32 + Math.sin(d.tw)*0.32;
-      ctx.beginPath();
-      ctx.fillStyle = `rgba(${d.hue[0]},${d.hue[1]},${d.hue[2]},${Math.max(0,a).toFixed(2)})`;
-      ctx.arc(d.x*cssW, d.y*cssH, 1.15, 0, Math.PI*2);
-      ctx.fill();
-    });
-    requestAnimationFrame(frame);
-  })(0);
-}
-
-/* ================================================================
-   AI MODEL PERFORMANCE — flowing dual-tone wave ribbon (canvas), two
-   sine traces (lime + violet) drifting in and out of phase, with soft
-   particle dots riding the crest, echoing the reference design.
-   ================================================================ */
-function initModelWave(){
-  const canvas = document.getElementById('modelWaveCanvas');
-  if(!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const cssW = canvas.clientWidth || 260, cssH = canvas.clientHeight || 64;
-  const dpr = Math.min(window.devicePixelRatio||1, 2);
-  canvas.width = cssW*dpr; canvas.height = cssH*dpr;
-  ctx.scale(dpr,dpr);
-
-  const waves = [
-    {amp:.30, freq:1.6, speed:.00085, phase:0, color:[157,255,31]},
-    {amp:.26, freq:1.3, speed:-.0007, phase:2.1, color:[180,99,255]},
-  ];
-  (function frame(t){
-    ctx.clearRect(0,0,cssW,cssH);
-    waves.forEach(w=>{
-      ctx.beginPath();
-      for(let x=0;x<=cssW;x+=3){
-        const nx = x/cssW;
-        const y = cssH/2 + Math.sin(nx*Math.PI*2*w.freq + t*w.speed + w.phase)*w.amp*cssH;
-        if(x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-      }
-      ctx.strokeStyle = `rgba(${w.color[0]},${w.color[1]},${w.color[2]},.8)`;
-      ctx.lineWidth = 1.6;
-      ctx.stroke();
-      // particles riding the curve
-      for(let i=0;i<10;i++){
-        const nx = (i/10 + (t*0.00004*Math.sign(w.speed||1))%1 + 1)%1;
-        const x = nx*cssW;
-        const y = cssH/2 + Math.sin(nx*Math.PI*2*w.freq + t*w.speed + w.phase)*w.amp*cssH;
-        ctx.beginPath();
-        ctx.fillStyle = `rgba(${w.color[0]},${w.color[1]},${w.color[2]},.9)`;
-        ctx.arc(x,y,1.3,0,Math.PI*2);
-        ctx.fill();
-      }
-    });
-    requestAnimationFrame(frame);
-  })(0);
-}
-
-/* ================================================================
    INIT
    ================================================================ */
+function autoConnectFromUrl(){
+  // This file is normally served BY the bot itself at /dashboard/<token> —
+  // in that case the origin and secret are already known, so auto-connect
+  // instead of making the operator retype them into the connect popover.
+  // If it's opened standalone (e.g. saved to disk) this quietly no-ops and
+  // the manual Connect flow above still works exactly as before.
+  try{
+    const parts = window.location.pathname.split('/').filter(Boolean);
+    const idx = parts.indexOf('dashboard');
+    if(idx !== -1 && parts[idx+1]){
+      const token = parts[idx+1];
+      const raw = localStorage.getItem(LIVE_STORAGE_KEY);
+      const already = raw ? JSON.parse(raw) : null;
+      if(!already || already.key !== token){
+        applyLiveConfig(window.location.origin, token);
+      }
+    }
+  }catch(e){ /* standalone file — no URL token to read, stay in demo mode */ }
+}
+
 document.addEventListener('DOMContentLoaded', ()=>{
   bootSequence();
   renderDate();
   initGaugesAndBars();
   loadLiveConfig();
+  autoConnectFromUrl();
   renderPositions();
   renderTrades();
   renderNews();
   renderGatekeeper();
+  renderRiskPanel();
   renderHeatmap();
   buildWaveform();
   loadCandles('1m');
   attachChartTooltip();
   try{ initOrb(); }catch(e){ showOrbFallback(); }
+  try{ initWorldMap(); }catch(e){ /* canvas unsupported — panel still shows its other data */ }
   try{ initStarfield(); }catch(e){ /* canvas unsupported — page still works without it */ }
-  try{ initWorldMap(); }catch(e){}
-  try{ initModelWave(); }catch(e){}
   setInterval(tickUptime, 1000); tickUptime();
   setInterval(tick, 2600);
   fetchRealFearGreed();
@@ -4615,7 +5700,8 @@ document.addEventListener('DOMContentLoaded', ()=>{
 });
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 @app.route("/", methods=["GET"])
@@ -4763,6 +5849,17 @@ def webhook(secret_token):
                     log.warning(f"🛑 Entry blocked by circuit breaker for {symbol}: {cb_reason}")
                     log_rejection(symbol, signal, direction, "circuit_breaker", cb_reason)
                     return jsonify({"status": "blocked_by_circuit_breaker", "reason": cb_reason}), 200
+
+                # [AI ORACLE MERGE — NEW] AI Gatekeeper. OFF by default
+                # (AI_ORACLE_GATE_TRADES=false) — see ai_oracle_gate_check()
+                # docstring. Strict veto only: never approves anything the
+                # gates above/below already rejected, never fires on a
+                # NEUTRAL or low-confidence oracle read.
+                gate_ok, gate_reason = ai_oracle_gate_check(symbol, direction)
+                if not gate_ok:
+                    log.warning(f"🔮 Entry for {symbol} blocked by AI Oracle Gatekeeper: {gate_reason}")
+                    log_rejection(symbol, signal, direction, "ai_oracle_gate", gate_reason)
+                    return jsonify({"status": "blocked_by_ai_oracle_gate", "reason": gate_reason}), 200
 
                 # premium_shield is checked before the order fires (cheap, no
                 # network, and Pine's own entry conditions already require it —
@@ -5184,84 +6281,29 @@ def mark_prices():
     return jsonify({"prices": prices})
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# [DASHBOARD NEW — REAL CANDLES] Real OHLCV straight from Delta's public
-# /v2/history/candles (same unsigned, no-auth market-data call
-# get_last_traded_price() already uses — confirmed against Delta's own API
-# docs). This is what lets the INFINITY dashboard's chart plot your bot's
-# actual traded symbol instead of a simulated random walk. Goes through the
-# shared delta_http Session like every other outbound Delta call in this
-# file, so it inherits the User-Agent fix automatically. Cached briefly per
-# (symbol, resolution, limit) so several open dashboard tabs polling every
-# few seconds don't multiply into N calls to Delta per tab.
-# ════════════════════════════════════════════════════════════════════════════════
-_candles_cache = {}
-_candles_cache_lock = threading.Lock()
-CANDLES_CACHE_MAX_AGE_S = 15
-_CANDLE_RESOLUTION_SECONDS = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
-    "1d": 86400, "7d": 604800, "30d": 2592000, "1w": 604800, "2w": 1209600,
-}
-
-
-@app.route("/candles", methods=["GET"])
+@app.route("/ai-oracle", methods=["GET"])
 @require_key
-def candles():
-    """GET /candles?symbol=BTCUSD&resolution=1m&limit=100
-    Proxies Delta's public history-candles endpoint so the browser dashboard
-    never has to talk to Delta directly (avoids CORS entirely, and keeps API
-    conventions — User-Agent, region, timeouts — in the one shared place).
-    Returns { symbol, resolution, candles:[{time,open,high,low,close,volume}] },
-    oldest first, same shape the dashboard's chart already expects.
-    """
-    symbol = (request.args.get("symbol") or "BTCUSD").strip().upper()
-    resolution = (request.args.get("resolution") or "1m").strip()
-    try:
-        limit = max(10, min(int(request.args.get("limit", 100)), 500))
-    except (TypeError, ValueError):
-        limit = 100
+def ai_oracle_endpoint():
+    """[AI ORACLE MERGE] Per-symbol ensemble consensus (Gemini vote + quant
+    vote), confidence, degraded/agreement flags, rolling self-scored
+    accuracy, Gemini circuit breaker state, and whether the AI Gatekeeper is
+    currently live-gating entries. Powers both the Mission Control dashboard
+    embedded below and, if wired up, the React dashboard."""
+    return jsonify(get_ai_oracle_snapshot())
 
-    cache_key = (symbol, resolution, limit)
-    now = time.time()
-    with _candles_cache_lock:
-        cached = _candles_cache.get(cache_key)
-        if cached and (now - cached["ts"]) < CANDLES_CACHE_MAX_AGE_S:
-            return jsonify({"symbol": symbol, "resolution": resolution, "candles": cached["candles"]})
 
-    step = _CANDLE_RESOLUTION_SECONDS.get(resolution, 60)
-    end_ts = int(now)
-    start_ts = end_ts - step * (limit + 2)
-
-    try:
-        resp = delta_http.get(
-            f"{BASE_URL}/v2/history/candles",
-            params={"symbol": symbol, "resolution": resolution, "start": start_ts, "end": end_ts},
-            timeout=6,
-        )
-        resp.raise_for_status()
-        raw = resp.json().get("result", []) or []
-    except Exception as e:
-        log.debug(f"/candles failed for {symbol}/{resolution}: {e}")
-        return jsonify({"symbol": symbol, "resolution": resolution, "candles": [], "error": "delta_unreachable"}), 200
-
-    raw = sorted(raw, key=lambda c: c.get("time", 0))[-limit:]
-    candles_out = [
-        {
-            "time": c.get("time"),
-            "open": safe_float(c.get("open")),
-            "high": safe_float(c.get("high")),
-            "low": safe_float(c.get("low")),
-            "close": safe_float(c.get("close")),
-            "volume": safe_float(c.get("volume")),
-        }
-        for c in raw
-    ]
-
-    with _candles_cache_lock:
-        _candles_cache[cache_key] = {"ts": now, "candles": candles_out}
-
-    return jsonify({"symbol": symbol, "resolution": resolution, "candles": candles_out})
+@app.route("/performance-summary", methods=["GET"])
+@require_key
+def performance_summary():
+    """[DASHBOARD WIRING] Real closed-trade performance — win rate, trade
+    count, cumulative/average R, profit factor — same numbers self-check
+    already computes from actual TRADE_CLOSE rows. This is what backs the
+    dashboard's 'AI Model Performance' panel; every field is None until
+    there's real trade history, never a placeholder number pretending to
+    be real."""
+    overall = _self_check_recent_performance()
+    by_signal = _self_check_performance_by_signal()
+    return jsonify({"overall": overall, "by_signal": by_signal})
 
 
 @app.route("/control/<secret>/pause", methods=["GET"])
@@ -5773,6 +6815,9 @@ Region: {REGION} | Base: {BASE_URL} | Live (env default): {LIVE_MODE_ENV_DEFAULT
     threading.Thread(target=_self_check_loop, daemon=True).start()
     log.info(f"🩺 Self-check loop started (every {SELF_CHECK_INTERVAL_S}s, "
              f"last {SELF_CHECK_LOOKBACK_TRADES} closed trades)")
+    threading.Thread(target=_ai_oracle_loop, daemon=True).start()
+    log.info(f"🔮 AI Oracle merged in-process — symbols={ORACLE_SYMBOLS}, every {ORACLE_INTERVAL_S}s "
+             f"(ensemble: Gemini + quant model, gate_trades={AI_ORACLE_GATE_TRADES})")
     if AGGRESSIVE_EXITS_ENABLED:
         threading.Thread(target=_aggressive_exits_loop, daemon=True).start()
         log.info(f"🎯 Aggressive Exits monitor started (breakeven +{BREAKEVEN_TRIGGER_R}R, "
