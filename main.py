@@ -125,6 +125,33 @@ try:
 except ImportError:
     psutil = None
 
+# ════════════════════════════════════════════════════════════════════════════════
+# [CRITICAL FIX — .env WAS NEVER ACTUALLY LOADED] Every config constant below
+# reads os.environ.get(...) directly. That's correct for a Railway-style host,
+# where values you set in the Railway dashboard get injected straight into
+# the process's real OS environment — no .env file involved at all. But nothing
+# in this file ever read a LOCAL .env file into os.environ, so on any host
+# where you manage secrets by hand-editing a .env next to this script (e.g. a
+# plain EC2/Ubuntu box), every edit to .env was silently invisible to this
+# process: DELTA_API_KEY/SECRET/REGION etc. below were reading whatever (if
+# anything) already happened to be set at the OS level — not what you just
+# wrote to .env — which is exactly why REGION could keep showing a value you
+# never put in .env, and why fixing the key in .env didn't change the 401.
+# override=True so .env is authoritative over any stray pre-existing OS-level
+# export (e.g. one left in ~/.bashrc from an earlier session); path is pinned
+# to the directory this script lives in so it doesn't matter which directory
+# you happen to `cd` into before running `python3 main.py`.
+try:
+    from dotenv import load_dotenv  # package: python-dotenv
+    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if load_dotenv(_ENV_PATH, override=True):
+        print(f"[env] loaded {_ENV_PATH}")
+    else:
+        print(f"[env] WARNING: no .env found at {_ENV_PATH} — relying on real OS env vars only")
+except ImportError:
+    print("[env] WARNING: python-dotenv not installed (pip install python-dotenv) — "
+          ".env will NOT be read; relying on real OS env vars only")
+
 _PROCESS_START_TIME = time.time()
 
 app = Flask(__name__)
@@ -2057,10 +2084,11 @@ def verify_api_credentials():
         log.info(f"✅ API credentials verified against Delta — {msg}")
     else:
         log.error(f"🚨 API CREDENTIALS INVALID — every real order will fail until this is fixed: {msg}\n"
-                  f"   Checklist: (1) DELTA_API_KEY/SECRET in Railway match Delta's dashboard EXACTLY, "
-                  f"no extra spaces/newlines from copy-paste  (2) the key hasn't been regenerated/revoked "
-                  f"on Delta's side since you set it  (3) the key has TRADING permission enabled, not "
-                  f"read-only  (4) if the key has an IP whitelist, Railway's outbound IP is on it  "
+                  f"   Checklist: (1) DELTA_API_KEY/SECRET in your .env match Delta's dashboard EXACTLY, "
+                  f"no extra spaces/newlines from copy-paste, and this process was actually restarted "
+                  f"after the last .env edit  (2) the key hasn't been regenerated/revoked on Delta's "
+                  f"side since you set it  (3) the key has TRADING permission enabled, not read-only  "
+                  f"(4) if the key has an IP whitelist, THIS server's outbound IP is on it  "
                   f"(5) DELTA_REGION={REGION} matches the account the key was created on "
                   f"(global vs india use separate credentials).")
     return ok, msg
