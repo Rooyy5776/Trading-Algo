@@ -126,31 +126,31 @@ except ImportError:
     psutil = None
 
 # ════════════════════════════════════════════════════════════════════════════════
-# [CRITICAL FIX — .env WAS NEVER ACTUALLY LOADED] Every config constant below
-# reads os.environ.get(...) directly. That's correct for a Railway-style host,
-# where values you set in the Railway dashboard get injected straight into
-# the process's real OS environment — no .env file involved at all. But nothing
-# in this file ever read a LOCAL .env file into os.environ, so on any host
-# where you manage secrets by hand-editing a .env next to this script (e.g. a
-# plain EC2/Ubuntu box), every edit to .env was silently invisible to this
-# process: DELTA_API_KEY/SECRET/REGION etc. below were reading whatever (if
-# anything) already happened to be set at the OS level — not what you just
-# wrote to .env — which is exactly why REGION could keep showing a value you
-# never put in .env, and why fixing the key in .env didn't change the 401.
-# override=True so .env is authoritative over any stray pre-existing OS-level
-# export (e.g. one left in ~/.bashrc from an earlier session); path is pinned
-# to the directory this script lives in so it doesn't matter which directory
-# you happen to `cd` into before running `python3 main.py`.
+# [CRITICAL FIX — .env WAS NEVER ACTUALLY LOADED] Every secret below (DELTA_API_KEY,
+# DELTA_API_SECRET, APEX_WEBHOOK_PASSPHRASE, etc.) is read via os.environ.get(...).
+# That only sees variables the ENCLOSING PROCESS already has — it does NOT read a
+# .env file sitting next to this script. On Railway/Render the platform itself
+# injects env vars straight into the process, so a .env file was never needed and
+# this gap stayed invisible. On a plain AWS EC2 box there is no such platform
+# injection: editing .env and re-running `python3 main.py` silently changed
+# nothing, because nothing ever read the file — the process just kept using
+# whatever was last `export`ed in that shell session (or nothing at all). THAT is
+# the actual reason repeated .env edits looked like they had zero effect. Fix:
+# explicitly load .env from the same directory as this script (works no matter
+# which folder you launch from), before any os.environ.get(...) call below.
+# Fails soft (one clear log line, never raises) if python-dotenv isn't installed
+# — so this can only help, never break, a Railway/Render deploy.
+# ════════════════════════════════════════════════════════════════════════════════
+from pathlib import Path
 try:
-    from dotenv import load_dotenv  # package: python-dotenv
-    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if load_dotenv(_ENV_PATH, override=True):
+    from dotenv import load_dotenv
+    _ENV_PATH = Path(__file__).resolve().parent / ".env"
+    if load_dotenv(dotenv_path=_ENV_PATH):
         print(f"[env] loaded {_ENV_PATH}")
     else:
-        print(f"[env] WARNING: no .env found at {_ENV_PATH} — relying on real OS env vars only")
+        print(f"[env] no .env file found at {_ENV_PATH} — relying on already-exported shell environment variables")
 except ImportError:
-    print("[env] WARNING: python-dotenv not installed (pip install python-dotenv) — "
-          ".env will NOT be read; relying on real OS env vars only")
+    print("[env] python-dotenv not installed (pip install python-dotenv) — relying on already-exported shell environment variables only")
 
 _PROCESS_START_TIME = time.time()
 
@@ -2084,11 +2084,10 @@ def verify_api_credentials():
         log.info(f"✅ API credentials verified against Delta — {msg}")
     else:
         log.error(f"🚨 API CREDENTIALS INVALID — every real order will fail until this is fixed: {msg}\n"
-                  f"   Checklist: (1) DELTA_API_KEY/SECRET in your .env match Delta's dashboard EXACTLY, "
-                  f"no extra spaces/newlines from copy-paste, and this process was actually restarted "
-                  f"after the last .env edit  (2) the key hasn't been regenerated/revoked on Delta's "
-                  f"side since you set it  (3) the key has TRADING permission enabled, not read-only  "
-                  f"(4) if the key has an IP whitelist, THIS server's outbound IP is on it  "
+                  f"   Checklist: (1) DELTA_API_KEY/SECRET in Railway match Delta's dashboard EXACTLY, "
+                  f"no extra spaces/newlines from copy-paste  (2) the key hasn't been regenerated/revoked "
+                  f"on Delta's side since you set it  (3) the key has TRADING permission enabled, not "
+                  f"read-only  (4) if the key has an IP whitelist, Railway's outbound IP is on it  "
                   f"(5) DELTA_REGION={REGION} matches the account the key was created on "
                   f"(global vs india use separate credentials).")
     return ok, msg
