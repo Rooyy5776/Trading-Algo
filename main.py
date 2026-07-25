@@ -4227,6 +4227,20 @@ const LIVE_STORAGE_KEY = 'apex_nexus_dashboard_connection';
 const connState = { lastLatencyMs:null, lastOk:null };
 
 function loadLiveConfig(){
+  // [FIXED] Auto-connect using the values the backend injected into this
+  // exact page (see the /dashboard/<token> route) — this is what makes
+  // self-hosted use work with zero manual setup. '__AUTO_BASE_URL__'/
+  // '__AUTO_KEY__' are the literal placeholder text only if something
+  // served this file WITHOUT going through that route (e.g. opened as a
+  // static .html file) — in that case this block is skipped and it falls
+  // back to the old manual Connect popover / localStorage, unchanged.
+  const autoBase = '__AUTO_BASE_URL__', autoKey = '__AUTO_KEY__';
+  if(autoBase && autoKey && !autoBase.includes('AUTO_BASE_URL') && !autoKey.includes('AUTO_KEY')){
+    LIVE.baseUrl = autoBase; LIVE.key = autoKey; LIVE.enabled = true;
+    try{ localStorage.setItem(LIVE_STORAGE_KEY, JSON.stringify({ baseUrl:LIVE.baseUrl, key:LIVE.key })); }catch(e){}
+    updateDataModeBadge();
+    return;
+  }
   try{
     const raw = localStorage.getItem(LIVE_STORAGE_KEY);
     if(raw){
@@ -5740,7 +5754,17 @@ def root():
 def dashboard(token):
     if not WEBHOOK_SECRET_TOKEN or not hmac.compare_digest(token, WEBHOOK_SECRET_TOKEN):
         return jsonify({"error": "unauthorized"}), 403
-    return DASHBOARD_HTML
+    # [FIXED] The dashboard used to ALWAYS start in "Simulated Data" mode
+    # (hardcoded $128,745.32 balance etc.) and only switch to real data
+    # after manually typing the backend URL + passphrase into the Connect
+    # popover — even when it's being served by this exact backend, which
+    # already knows both values. Injecting them here means it connects to
+    # itself automatically on load. The manual Connect/Disconnect flow
+    # still works as before for the separate case of opening this HTML
+    # standalone against a different bot.
+    auto_base = request.host_url.rstrip("/")
+    html = DASHBOARD_HTML.replace("__AUTO_BASE_URL__", auto_base).replace("__AUTO_KEY__", token)
+    return html
 
 
 # ════════════════════════════════════════════════════════════════════════════════
