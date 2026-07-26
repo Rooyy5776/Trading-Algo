@@ -3181,7 +3181,7 @@ button{font-family:inherit;}
 /* ================================================================
    LAYOUT SHELL
    ================================================================ */
-.app-shell{position:relative;z-index:1;max-width:1680px;margin:0 auto;padding:14px 14px 0;display:flex;flex-direction:column;gap:16px;}
+.app-shell{position:relative;z-index:1;max-width:1680px;margin:0 auto;padding:14px 14px calc(96px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:16px;}
 
 /* ================================================================
    TOPBAR
@@ -3358,6 +3358,33 @@ button{font-family:inherit;}
 .settings-row .v.on{color:var(--lime);} .settings-row .v.off{color:var(--text-dim);} .settings-row .v.danger{color:var(--coral);}
 .signal-tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;margin:2px 3px 0 0;background:rgba(157,255,31,.1);color:var(--lime-soft);border:1px solid rgba(157,255,31,.25);}
 .signal-tag.off{background:rgba(255,255,255,.03);color:var(--text-dim);border-color:var(--panel-border);}
+
+/* [CONTROL WIRING NEW] Mode segmented switch, small flag toggle, Signal
+   Switchboard grid — these back real /mode, /control/.../risk-sizing, and
+   /signals endpoints that already existed server-side with nothing in the
+   UI to trigger them. */
+.mode-switch{display:inline-flex;background:rgba(255,255,255,.04);border:1px solid var(--panel-border);
+  border-radius:20px;padding:3px;gap:3px;}
+.mode-switch-opt{border:none;background:transparent;font-family:var(--font-display);font-size:9.5px;font-weight:700;
+  letter-spacing:.04em;color:var(--text-dim);padding:7px 14px;border-radius:16px;cursor:pointer;transition:all .18s ease;}
+.mode-switch-opt.active-dry{background:rgba(157,255,31,.16);color:var(--lime-soft);}
+.mode-switch-opt.active-live{background:rgba(255,79,109,.9);color:#fff;box-shadow:0 0 12px rgba(255,79,109,.45);}
+.mode-switch-opt:disabled{opacity:.5;cursor:not-allowed;}
+.flag-toggle{font-family:var(--font-display);font-size:10px;font-weight:700;padding:6px 13px;border-radius:20px;
+  cursor:pointer;letter-spacing:.03em;transition:all .15s ease;background:rgba(255,255,255,.03);color:var(--text-dim);
+  border:1px solid var(--panel-border);}
+.flag-toggle.on{background:rgba(157,255,31,.14);color:var(--lime-soft);border-color:rgba(157,255,31,.4);}
+.flag-toggle:active{transform:scale(.95);}
+.flag-toggle:disabled{opacity:.5;cursor:not-allowed;}
+.sig-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
+.sig-toggle{display:flex;align-items:center;justify-content:space-between;font-family:var(--font-display);
+  font-size:11px;font-weight:700;letter-spacing:.03em;padding:11px 13px;border-radius:10px;cursor:pointer;
+  background:rgba(255,255,255,.02);color:var(--text-mid);border:1px solid var(--panel-border);transition:all .15s ease;}
+.sig-toggle.on{background:rgba(157,255,31,.1);color:var(--lime-soft);border-color:rgba(157,255,31,.35);}
+.sig-toggle .sig-state{font-size:8.5px;font-weight:700;opacity:.7;letter-spacing:.05em;}
+.sig-toggle:active{transform:scale(.97);}
+.sig-toggle:disabled{opacity:.5;cursor:not-allowed;}
+.integrity-chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}
 
 .stat-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .stat-mini{background:rgba(255,255,255,.02);border:1px solid var(--panel-border);border-radius:10px;padding:11px 12px;}
@@ -3557,8 +3584,18 @@ button{font-family:inherit;}
 /* ================================================================
    BOTTOM NAV
    ================================================================ */
-.bottom-nav{display:flex;align-items:center;gap:8px;background:var(--panel-bg);border:1px solid var(--panel-border);
-  border-radius:var(--radius);padding:10px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);}
+.bottom-nav{display:flex;align-items:center;gap:8px;background:rgba(9,16,28,.86);border:1px solid var(--panel-border);
+  border-radius:var(--radius) var(--radius) 0 0;padding:10px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  /* [BUGFIX — PREMIUM] This nav holds the Autopilot/Settings tabs — the only
+     way to reach Pause/Resume/Kill-Switch/Mode/Signal controls. It used to
+     sit in normal document flow at the very bottom of a very long page, so
+     on a phone you had to scroll past every panel just to see it existed —
+     easy to mistake for "there is no control panel". Fixed to the viewport
+     instead, like a standard app tab bar, so it's reachable from anywhere. */
+  position:fixed; left:50%; bottom:0; transform:translateX(-50%); z-index:40;
+  width:calc(100% - 28px); max-width:1652px; margin:0;
+  padding-bottom:calc(10px + env(safe-area-inset-bottom));
+  box-shadow:0 -10px 30px rgba(0,0,0,.5);}
 .nav-arrow{background:rgba(255,255,255,.04);border:1px solid var(--panel-border);color:var(--text-mid);width:34px;height:34px;
   border-radius:9px;cursor:pointer;flex-shrink:0;display:grid;place-items:center;}
 .nav-arrow svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;}
@@ -3595,7 +3632,7 @@ button{font-family:inherit;}
 /* ================================================================
    TOAST
    ================================================================ */
-.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,140%);z-index:50;
+.toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translate(-50%,140%);z-index:50;
   background:rgba(10,18,32,.92);border:1px solid var(--panel-border-strong);border-radius:10px;padding:11px 18px;
   font-size:12px;color:var(--text-hi);backdrop-filter:blur(12px);transition:transform .35s cubic-bezier(.16,.84,.44,1);
   max-width:88vw;text-align:center;box-shadow:0 10px 30px -8px rgba(0,0,0,.6);}
@@ -4218,29 +4255,19 @@ const state = {
      GET /rejections     -> { rejections:[{ symbol, signal, direction, reason, detail, timestamp }] }
      GET /execution-stats -> { count, avg_ms, fastest_ms, slowest_ms, success_rate }
      GET /system-health  -> { available, uptime_seconds, cpu_percent, memory_percent, memory_mb, thread_count }
-   No control actions (pause/resume/close-all/kill-switch) are wired
-   here on purpose — those actually move real money and deserve their
-   own confirmation UX, not a voice command or a demo toggle.
+   [CONTROL WIRING NEW] Control actions (mode/pause/resume/close-all/
+   kill-switch/signals/risk-sizing/circuit-breaker-reset/self-check) ARE
+   wired now — but only inside the dedicated Autopilot tab below, each
+   behind its own explicit tap + confirmAction() dialog where the action is
+   risk-increasing or hard to reverse. Still never exposed as a voice
+   command (see matchCommand()) or a silent demo toggle — that part of the
+   original design intent stands.
    ------------------------------------------------------------ */
 const LIVE = { enabled:false, baseUrl:'', key:'' };
 const LIVE_STORAGE_KEY = 'apex_nexus_dashboard_connection';
 const connState = { lastLatencyMs:null, lastOk:null };
 
 function loadLiveConfig(){
-  // [FIXED] Auto-connect using the values the backend injected into this
-  // exact page (see the /dashboard/<token> route) — this is what makes
-  // self-hosted use work with zero manual setup. '__AUTO_BASE_URL__'/
-  // '__AUTO_KEY__' are the literal placeholder text only if something
-  // served this file WITHOUT going through that route (e.g. opened as a
-  // static .html file) — in that case this block is skipped and it falls
-  // back to the old manual Connect popover / localStorage, unchanged.
-  const autoBase = '__AUTO_BASE_URL__', autoKey = '__AUTO_KEY__';
-  if(autoBase && autoKey && !autoBase.includes('AUTO_BASE_URL') && !autoKey.includes('AUTO_KEY')){
-    LIVE.baseUrl = autoBase; LIVE.key = autoKey; LIVE.enabled = true;
-    try{ localStorage.setItem(LIVE_STORAGE_KEY, JSON.stringify({ baseUrl:LIVE.baseUrl, key:LIVE.key })); }catch(e){}
-    updateDataModeBadge();
-    return;
-  }
   try{
     const raw = localStorage.getItem(LIVE_STORAGE_KEY);
     if(raw){
@@ -4287,7 +4314,7 @@ async function liveFetch(path){
 }
 
 const _lastLiveTickerPrice = {};
-const LIVECACHE = { status:null, positions:null, rawPositions:null, balance:null, config:null, marks:null, cycles:null, stats:null };
+const LIVECACHE = { status:null, positions:null, rawPositions:null, balance:null, config:null, marks:null, cycles:null, stats:null, lastSelfCheck:null };
 
 async function pollLive(){
   if(!LIVE.enabled) return;
@@ -4406,24 +4433,75 @@ async function callControl(action){
     return body;
   }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
 }
+// [CONTROL WIRING NEW] Same pattern as callControl(), but for the two
+// endpoints that don't live under /control/<key>/ — live/dry-run mode and
+// per-tier signal enable/disable. Both were already real, working backend
+// endpoints; nothing in the dashboard called them yet.
+async function callMode(liveBool){
+  if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
+  try{
+    const res = await fetch(LIVE.baseUrl + '/mode/' + encodeURIComponent(LIVE.key) + '?live_mode=' + (liveBool ? 'true' : 'false'), { cache:'no-store' });
+    const body = await res.json().catch(()=>({}));
+    if(!res.ok){ showToast('Mode change failed: ' + (body.error || res.status)); return null; }
+    return body;
+  }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
+}
+async function callSignals(tier, enable){
+  if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
+  try{
+    const qs = (enable ? 'enable=' : 'disable=') + encodeURIComponent(tier);
+    const res = await fetch(LIVE.baseUrl + '/signals/' + encodeURIComponent(LIVE.key) + '?' + qs, { cache:'no-store' });
+    const body = await res.json().catch(()=>({}));
+    if(!res.ok){ showToast('Signal toggle failed: ' + (body.error || res.status)); return null; }
+    return body;
+  }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
+}
 
+const ALL_SIGNAL_TIERS_FALLBACK = ['NEXUS','STRONG','FAST','WARP','GHOST','RECOVERY','PULLBACK','SCALP'];
+function renderSelfCheckResultHTML(r){
+  const si = r.system_integrity || {}, perf = r.performance || {};
+  const chip = (label,ok)=> '<span class="engine-chip '+(ok?'on':'danger')+'">'+label+(ok?' OK':' FAIL')+'</span>';
+  const issues = (si.issues||[]);
+  return '<div class="panel" style="padding:14px;margin-top:2px;">'+
+      '<div class="settings-row"><span class="k">Last Self-Check</span><span class="v '+(si.all_ok?'on':'danger')+'">'+(si.all_ok?'ALL SYSTEMS OK':issues.length+' ISSUE(S)')+'</span></div>'+
+      '<div class="integrity-chip-row">'+
+        chip('DB Tables', si.tables_ok)+chip('Routes', si.routes_ok)+chip('Core Engine', si.objects_ok)+chip('API Creds', si.api_credentials_ok)+
+      '</div>'+
+      (issues.length ? '<div style="margin-top:10px;font-size:10.5px;color:var(--coral);line-height:1.7;">'+issues.map(i=>'• '+i).join('<br>')+'</div>' : '')+
+      (perf && perf.n!=null ? '<div class="settings-row" style="margin-top:6px;"><span class="k">Recent Performance</span><span class="v">'+perf.win_rate+'% win · '+perf.n+' trades · '+(perf.cum_r>=0?'+':'')+perf.cum_r+'R</span></div>' : '')+
+    '</div>';
+}
 function renderAutopilotTab(){
   const body = document.getElementById('autopilotBody');
   if(!LIVE.enabled){
     body.innerHTML = '<div class="tab-empty"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>'+
-      'Connect your live bot to control it from here — pause/resume entries, arm the kill switch, or close every open position.'+
+      'Connect your live bot to control it from here — mode, pause/resume, signal tiers, kill switch, or close every open position.'+
       '<button class="connect-cta" type="button" id="autopilotConnectCta">Connect Now</button></div>';
     document.getElementById('autopilotConnectCta').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
     return;
   }
   const cfg = LIVECACHE.config || {};
   const paused = !!cfg.paused, killed = !!cfg.kill_switch_active, live = !!cfg.live_mode;
+  const riskSizing = !!cfg.risk_based_sizing;
   const cb = cfg.circuit_breaker || {};
+  const activeSignals = new Set((cfg.active_signals||[]).map(s=>s.toUpperCase()));
+  const allSignals = (cfg.all_known_signals && cfg.all_known_signals.length) ? cfg.all_known_signals : ALL_SIGNAL_TIERS_FALLBACK;
   let bannerClass='ok', bannerText = live ? 'LIVE — placing real orders' : 'DRY RUN — no real orders sent';
   if(paused){ bannerClass='paused'; bannerText='PAUSED — no new entries will be taken'; }
   if(killed){ bannerClass='danger'; bannerText='KILL SWITCH ARMED — all new entries blocked'; }
   body.innerHTML =
     '<div class="status-banner '+bannerClass+'"><span class="status-dot"></span>'+bannerText+'</div>'+
+    '<div class="panel" style="padding:14px;margin-top:2px;">'+
+      '<div class="settings-row"><span class="k">Trading Mode</span>'+
+        '<div class="mode-switch" role="group" aria-label="Trading mode">'+
+          '<button type="button" class="mode-switch-opt '+(!live?'active-dry':'')+'" id="modeOptDry">DRY RUN</button>'+
+          '<button type="button" class="mode-switch-opt '+(live?'active-live':'')+'" id="modeOptLive">LIVE</button>'+
+        '</div>'+
+      '</div>'+
+      '<div class="settings-row"><span class="k">Dynamic (Risk-Based) Sizing</span>'+
+        '<button class="flag-toggle '+(riskSizing?'on':'')+'" id="btnRiskSizing" type="button" role="switch" aria-checked="'+riskSizing+'">'+(riskSizing?'ON':'OFF')+'</button>'+
+      '</div>'+
+    '</div>'+
     '<div class="act-row">'+
       '<button class="act-btn primary" id="btnResume" '+(!paused?'disabled':'')+'>Resume Trading<span class="sub">Allow new entries again</span></button>'+
       '<button class="act-btn warn" id="btnPause" '+(paused?'disabled':'')+'>Pause<span class="sub">Block new entries · open trades keep running</span></button>'+
@@ -4432,11 +4510,25 @@ function renderAutopilotTab(){
       '<button class="act-btn '+(killed?'primary':'danger')+'" id="btnKill">'+(killed?'Disarm Kill Switch':'Arm Kill Switch')+'<span class="sub">'+(killed?'Resume normal operation':'Blocks new entries until manually reset')+'</span></button>'+
       '<button class="act-btn danger" id="btnCloseAll">Close All Positions<span class="sub">Market-close every open trade now</span></button>'+
     '</div>'+
+    '<div class="act-row">'+
+      '<button class="act-btn '+(cb.tripped?'warn':'')+'" id="btnResetCB">Reset Circuit Breaker<span class="sub">'+(cb.tripped?'TRIPPED — clear to allow entries again':'Manual override before UTC-midnight auto-reset')+'</span></button>'+
+      '<button class="act-btn" id="btnSelfCheck">Run Self-Check<span class="sub">On-demand system + performance check</span></button>'+
+    '</div>'+
     '<div class="panel" style="padding:14px;margin-top:2px;">'+
       '<div class="settings-row"><span class="k">Circuit Breaker</span><span class="v '+(cb.tripped?'danger':'on')+'">'+(cb.tripped?'TRIPPED':'Clear')+'</span></div>'+
       '<div class="settings-row"><span class="k">Consecutive Losses</span><span class="v">'+(cb.consecutive_losses ?? '—')+' / '+(cb.max_consecutive_losses ?? '—')+'</span></div>'+
-      '<div class="settings-row"><span class="k">Mode</span><span class="v '+(live?'danger':'on')+'">'+(live?'LIVE (real orders)':'DRY RUN (simulated)')+'</span></div>'+
-    '</div>';
+    '</div>'+
+    '<div class="panel" style="padding:14px;margin-top:2px;">'+
+      '<div class="settings-row" style="border-bottom:none;padding-bottom:0;"><span class="k">Signal Switchboard</span><span class="v">'+activeSignals.size+'/'+allSignals.length+' ACTIVE</span></div>'+
+      '<div class="sig-grid">'+
+        allSignals.map(s=>{
+          const on = activeSignals.has(String(s).toUpperCase());
+          return '<button class="sig-toggle '+(on?'on':'')+'" data-sig="'+s+'" type="button">'+s+'<span class="sig-state">'+(on?'ON':'OFF')+'</span></button>';
+        }).join('')+
+      '</div>'+
+    '</div>'+
+    (LIVECACHE.lastSelfCheck ? renderSelfCheckResultHTML(LIVECACHE.lastSelfCheck) : '');
+
   document.getElementById('btnPause').onclick = ()=> confirmAction('Pause trading?',
     'No new entries will be taken until you resume. Positions already open keep running with their normal SL/TP/trailing logic — pausing does not touch them.',
     async ()=>{ const r = await callControl('pause'); if(r){ showToast('Paused.'); await pollLive(); renderAutopilotTab(); } });
@@ -4455,6 +4547,43 @@ function renderAutopilotTab(){
   document.getElementById('btnCloseAll').onclick = ()=> confirmAction('Close ALL open positions?',
     'Immediately market-closes every open position at whatever price is available right now — it does not wait for TP/SL levels, and this cannot be undone.',
     async ()=>{ const r = await callControl('close-all'); if(r){ showToast('Close-all sent.'); await pollLive(); renderAutopilotTab(); } });
+  document.getElementById('btnResetCB').onclick = ()=> confirmAction('Reset the circuit breaker?',
+    'Clears today\'s daily-loss and consecutive-loss counters so entries can resume before the automatic UTC-midnight reset. Does not touch Pause or the Kill Switch — those stay exactly as they are.',
+    async ()=>{ const r = await callControl('reset-circuit-breaker'); if(r){ showToast('Circuit breaker reset.'); await pollLive(); renderAutopilotTab(); } });
+  document.getElementById('btnSelfCheck').onclick = async ()=>{
+    const btn = document.getElementById('btnSelfCheck');
+    btn.disabled = true;
+    const sub = btn.querySelector('.sub'); if(sub) sub.textContent = 'Running…';
+    const r = await callControl('self-check');
+    if(r){ LIVECACHE.lastSelfCheck = r; showToast((r.system_integrity && r.system_integrity.all_ok) ? 'Self-check passed — all systems nominal.' : 'Self-check found issue(s) — see details below.'); }
+    renderAutopilotTab();
+  };
+  document.getElementById('btnRiskSizing').onclick = ()=>{
+    const next = !riskSizing;
+    const go = async ()=>{ const r = await callControl('risk-sizing?enabled='+(next?'true':'false')); if(r){ showToast('Dynamic sizing '+(next?'enabled':'disabled')+'.'); await pollLive(); renderAutopilotTab(); } };
+    if(next){ confirmAction('Turn ON dynamic sizing?', 'New entries will size position quantity based on account risk instead of the fixed per-tier amount.', go); }
+    else { go(); }
+  };
+  document.getElementById('modeOptLive').onclick = ()=>{
+    if(live) return;
+    confirmAction('Switch to LIVE mode?',
+      'New entries will place REAL orders on Delta Exchange with real money. Make sure sizing, SL/TP, and active signal tiers are exactly what you want before confirming.',
+      async ()=>{ const r = await callMode(true); if(r){ showToast('Switched to LIVE — real orders will be placed.'); await pollLive(); renderAutopilotTab(); } });
+  };
+  document.getElementById('modeOptDry').onclick = async ()=>{
+    if(!live) return;
+    const r = await callMode(false);
+    if(r){ showToast('Switched to DRY RUN — no real orders will be sent.'); await pollLive(); renderAutopilotTab(); }
+  };
+  document.querySelectorAll('.sig-toggle').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const sig = btn.dataset.sig, isOn = btn.classList.contains('on');
+      document.querySelectorAll('.sig-toggle').forEach(b=> b.disabled = true);
+      const r = await callSignals(sig, !isOn);
+      if(r){ showToast(sig+' turned '+(isOn?'OFF':'ON')+'.'); await pollLive(); }
+      renderAutopilotTab();
+    };
+  });
 }
 
 function renderVaultTab(){
@@ -4553,15 +4682,15 @@ function renderSettingsTab(){
     '<div class="settings-row"><span class="k">Clock Drift</span><span class="v '+((td.drift_ms==null||Math.abs(td.drift_ms)<1000)?'on':'danger')+'">'+(td.drift_ms!=null?Math.round(td.drift_ms)+'ms':'—')+'</span></div>'+
     '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Signal Tiers</div>'+
     '<div>'+tags+'</div>'+
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:6px;">Toggle these from the Autopilot tab.</div>'+
     '<div class="panel-title" style="margin:18px 0 2px;font-size:10.5px;">Feature Flags</div>'+
     flag('HFT Parallel Exits', c.hft_parallel_exits) +
     flag('Predator Vision', c.predator_vision_enabled) +
-    flag('Risk-Based Sizing', c.risk_based_sizing) +
     flag('Aggressive Exits', c.aggressive_exits_enabled) +
     flag('Neural Syndicate', c.neural_syndicate_enabled) +
     flag('Shock Entry Block', c.block_entries_during_shock) +
     flag('Telegram Alerts', c.telegram_enabled) +
-    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">Read-only — this mirrors your bot\'s real /config response. Changing any of these requires an env var change + redeploy, not a toggle here, so nothing on this screen can silently drift from what\'s actually running.</div>';
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">Read-only — this mirrors your bot\'s real /config response. Changing any of these requires an env var change + redeploy, not a toggle here, so nothing on this screen can silently drift from what\'s actually running. (Mode, Signal Tiers, and Dynamic Sizing DO have live toggles now — see the Autopilot tab.)</div>';
 }
 
 function renderAiOracle(oracleJ){
@@ -5273,11 +5402,23 @@ function jitterFooter(){
   document.getElementById('stat-srvlatency').textContent = state.srvLatency+'ms';
 }
 function tick(){
-  jitterPrices(); jitterAccount(); jitterLatencies(); jitterFooter(); jitterPositions();
+  // [BUGFIX — PREMIUM] jitter*/addSynthetic* below exist purely to make the
+  // dashboard feel alive in DEMO mode (no bot connected — see the
+  // "Simulated Data" badge). They used to run unconditionally, which meant
+  // that once a real bot WAS connected via LIVE.enabled, they kept stomping
+  // the real balance/price/position/trade numbers pollLive() had just
+  // fetched with small random deltas every 2.6s. That's the exact
+  // mechanism that let a real ~$700 balance drift into garbage like $1.42
+  // / "-100.30%" purely from repeated fake jitter — nothing was actually
+  // happening on the account. Now: LIVE connected -> ONLY real data from
+  // pollLive() below; disconnected -> full simulated demo, exactly as before.
+  if(!LIVE.enabled){
+    jitterPrices(); jitterAccount(); jitterLatencies(); jitterFooter(); jitterPositions();
+    if(Math.random() < 0.32) addSyntheticTrade();
+    if(Math.random() < 0.16) addSyntheticNews();
+  }
   if(chartState.liveCandles){ loadCandles(chartState.tf); } else { tickChart(); }
   pollLive();
-  if(Math.random() < 0.32) addSyntheticTrade();
-  if(Math.random() < 0.16) addSyntheticNews();
 }
 
 function tickUptime(){
@@ -5754,17 +5895,7 @@ def root():
 def dashboard(token):
     if not WEBHOOK_SECRET_TOKEN or not hmac.compare_digest(token, WEBHOOK_SECRET_TOKEN):
         return jsonify({"error": "unauthorized"}), 403
-    # [FIXED] The dashboard used to ALWAYS start in "Simulated Data" mode
-    # (hardcoded $128,745.32 balance etc.) and only switch to real data
-    # after manually typing the backend URL + passphrase into the Connect
-    # popover — even when it's being served by this exact backend, which
-    # already knows both values. Injecting them here means it connects to
-    # itself automatically on load. The manual Connect/Disconnect flow
-    # still works as before for the separate case of opening this HTML
-    # standalone against a different bot.
-    auto_base = request.host_url.rstrip("/")
-    html = DASHBOARD_HTML.replace("__AUTO_BASE_URL__", auto_base).replace("__AUTO_KEY__", token)
-    return html
+    return DASHBOARD_HTML
 
 
 # ════════════════════════════════════════════════════════════════════════════════
