@@ -108,10 +108,10 @@ import re
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, List, Tuple
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 from abc import ABC, abstractmethod
 
 import requests
@@ -126,6 +126,37 @@ try:
     import psutil  # package: psutil — only needed for the System Health panel
 except ImportError:
     psutil = None
+
+# ════════════════════════════════════════════════════════════════════════════════
+# [CRITICAL FIX — .env WAS NEVER ACTUALLY LOADED] Every secret below (DELTA_API_KEY,
+# DELTA_API_SECRET, APEX_WEBHOOK_PASSPHRASE, etc.) is read via os.environ.get(...).
+# That only sees variables the ENCLOSING PROCESS already has — it does NOT read a
+# .env file sitting next to this script. On Railway/Render the platform itself
+# injects env vars straight into the process, so a .env file was never needed and
+# this gap stayed invisible. On a plain AWS EC2 box there is no such platform
+# injection: editing .env and re-running `python3 main.py` silently changed
+# nothing, because nothing ever read the file — the process just kept using
+# whatever was last `export`ed in that shell session (or nothing at all). THAT is
+# the actual reason repeated .env edits looked like they had zero effect. Fix:
+# explicitly load .env from the same directory as this script (works no matter
+# which folder you launch from), before any os.environ.get(...) call below.
+# Fails soft (one clear log line, never raises) if python-dotenv isn't installed
+# — so this can only help, never break, a Railway/Render deploy.
+# [RESTORED — this block was present and confirmed working in the previous
+# deploy (boot log showed "[env] loaded /home/ubuntu/Trading-Algo/.env") but
+# was missing from this uploaded version — likely dropped during merging in
+# the broker/Zerodha changes. Re-added at the same position, byte-for-byte.]
+# ════════════════════════════════════════════════════════════════════════════════
+from pathlib import Path
+try:
+    from dotenv import load_dotenv
+    _ENV_PATH = Path(__file__).resolve().parent / ".env"
+    if load_dotenv(dotenv_path=_ENV_PATH):
+        print(f"[env] loaded {_ENV_PATH}")
+    else:
+        print(f"[env] no .env file found at {_ENV_PATH} — relying on already-exported shell environment variables")
+except ImportError:
+    print("[env] python-dotenv not installed (pip install python-dotenv) — relying on already-exported shell environment variables only")
 
 _PROCESS_START_TIME = time.time()
 
@@ -1489,6 +1520,27 @@ def _ai_oracle_loop():
 # ════════════════════════════════════════════════════════════════════════════════
 @contextlib.contextmanager
 def db():
+    """
+    [CRITICAL FIX — file-descriptor leak] `sqlite3.Connection` used as
+    `with conn:` only wraps the TRANSACTION (commit on clean exit, rollback
+    on exception) — it does NOT close the connection. Every one of the ~35
+    call sites in this file do `with db() as conn:` expecting normal
+    context-manager close-on-exit behaviour, so every single one of them was
+    leaking one open file handle + one open SQLite connection, forever, on
+    every call. Over hours of the self-check loop (every 900s), aggressive-
+    exits loop (every 15s), AI oracle loop (every 60s) etc. all hammering the
+    DB, this silently climbs until the process hits the OS's open-file limit
+    — which is exactly the cascading "OSError: [Errno 24] Too many open
+    files" / "sqlite3.OperationalError: unable to open database file" crash
+    seen in production (it even took down the werkzeug debug reloader,
+    which needs its own file handle to do its job).
+
+    Turning db() into a real generator-based context manager fixes every
+    `with db() as conn:` call site at once, with zero changes needed at any
+    of those call sites — the `as conn` binding and indentation all still
+    work exactly the same; only what happens at the end of the `with` block
+    changes (connection now actually closes).
+    """
     # timeout=10: if the DB is briefly locked by another connection, wait up
     # to 10s and retry instead of failing immediately with "database is locked".
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -1498,21 +1550,6 @@ def db():
     # more than one request in flight at once (e.g. gunicorn -w > 1).
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
-    # [CRITICAL FIX — FD LEAK / crash after running a while] sqlite3.Connection
-    # implements __enter__/__exit__ itself, but that built-in context manager
-    # only commits (on success) or rolls back (on exception) — it does NOT
-    # close the connection. Every "with db() as conn:" in this file was
-    # trusting `with` to close it the way it closes a file; it never did.
-    # Each call leaked one connection (plus WAL's extra -wal/-shm file
-    # handles) for the rest of the process's life. Enough of those over
-    # enough hours/days and the process hits its open-file-descriptor limit:
-    # "OSError: [Errno 24] Too many open files" /
-    # "sqlite3.OperationalError: unable to open database file" — which is
-    # unrecoverable without a restart. Making this a real @contextmanager
-    # with try/finally: conn.close() fixes all 31 call sites at once — every
-    # "with db() as conn:" elsewhere in the file is unchanged and keeps its
-    # existing commit-on-success / rollback-on-exception behavior, it just
-    # now actually closes too.
     try:
         yield conn
         conn.commit()
@@ -1925,18 +1962,20 @@ def notify_telegram(text: str):
 # DELTA API — SIGNED REQUESTS
 # ════════════════════════════════════════════════════════════════════════════════
 def _signed_request(method: str, path: str, payload_dict: Dict = None) -> Optional[Dict]:
-    # [CRITICAL FIX — REGRESSION] Without this, the "use Delta's own
-    # authoritative server_time from the error body" correction further
-    # below (`_time_drift_ms = ...`) silently creates a LOCAL variable
-    # instead of updating the module-level drift used by every future
-    # signed request — Python decides a name is local to a function at
-    # compile time if it's assigned anywhere in that function, unless it's
-    # declared global first. That's exactly why the corrected value never
-    # stuck: every request kept re-signing with the old, wrong drift and
-    # kept failing with expired_signature no matter how many times this
-    # "fix" ran. Same bug class as the one already fixed in
-    # sync_time_with_delta() — but that fix lives in a different function's
-    # scope, so it didn't cover this one.
+    # [CRITICAL FIX — root cause of the persistent "API CREDENTIALS INVALID
+    # / expired_signature" storm] This function corrects clock drift using
+    # Delta's own authoritative server_time (see _apply_drift_correction_
+    # from_body below), and that correction assigns to the module-level
+    # _time_drift_ms. Without declaring it `global` here, Python silently
+    # scopes that assignment as a brand-new LOCAL variable for this whole
+    # function — the correction looked like it worked (the log line printed
+    # "Corrected clock drift...") but it only ever updated a throwaway local
+    # copy that vanished when the function returned. The REAL global
+    # _time_drift_ms — the one get_time_drift_ms()/synced_timestamp_ms()
+    # everywhere else in this file actually read — was never touched. Every
+    # later signed request kept using the same stale drift, so the very next
+    # call failed with the exact same error, forever. (Confirmed with a
+    # 3-line repro of this exact scoping trap before writing this fix.)
     global _time_drift_ms
     if not API_KEY or not API_SECRET:
         raise ValueError("DELTA_API_KEY / DELTA_API_SECRET not set")
@@ -1963,11 +2002,39 @@ def _signed_request(method: str, path: str, payload_dict: Dict = None) -> Option
     # The time-drift MEASUREMENT itself (sync_time_with_delta) was correct —
     # only this final assembly step was wrong, which is why the earlier
     # smoke test (no real network access to Delta) couldn't have caught it.
+
+    def _build_headers(ts_seconds: str) -> Dict:
+        sig_msg = method.upper() + ts_seconds + path + payload
+        signature = hmac.new(API_SECRET.encode(), sig_msg.encode(), hashlib.sha256).hexdigest()
+        return {"api-key": API_KEY, "timestamp": ts_seconds, "signature": signature,
+                "Content-Type": "application/json", "User-Agent": DELTA_USER_AGENT}
+
+    def _looks_like_signature_issue(text: str) -> bool:
+        text = (text or "").lower()
+        return any(tok in text for tok in ("expired_signature", "signature", "timestamp"))
+
+    def _apply_drift_correction_from_body(err_obj: Dict) -> bool:
+        """Delta's own error body hands us the exact clock that validates
+        signatures directly — {"error":{"context":{"server_time":...}}} —
+        which is more authoritative than resyncing against a public
+        endpoint's Date header (that can be answered by a different edge/CDN
+        node than the one that actually validates the HMAC signature).
+        Returns True if it found and applied a correction."""
+        try:
+            auth_server_time = (err_obj or {}).get("error", {}).get("context", {}).get("server_time")
+            if auth_server_time is not None:
+                with _time_drift_lock:
+                    _time_drift_ms = float(auth_server_time) * 1000 - time.time() * 1000
+                log.warning(f"🕒 Corrected clock drift using Delta's own signing-server "
+                            f"time from this error's response ({auth_server_time}) — more "
+                            f"authoritative than /v2/products' Date header for this purpose.")
+                return True
+        except Exception:
+            pass
+        return False
+
     timestamp = str(int(synced_timestamp_ms() / 1000))
-    sig_msg = method.upper() + timestamp + path + payload
-    signature = hmac.new(API_SECRET.encode(), sig_msg.encode(), hashlib.sha256).hexdigest()
-    headers = {"api-key": API_KEY, "timestamp": timestamp, "signature": signature,
-               "Content-Type": "application/json", "User-Agent": DELTA_USER_AGENT}
+    headers = _build_headers(timestamp)
 
     last_err = None
     resynced_once = False
@@ -1978,7 +2045,32 @@ def _signed_request(method: str, path: str, payload_dict: Dict = None) -> Option
             else:
                 resp = delta_http.request(method.upper(), url, headers=headers, data=payload, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
-            return resp.json()
+            result = resp.json()
+            # [CRITICAL FIX] Delta signals an expired/invalid signature with
+            # HTTP 200 + {"success": false, "error": {"code": "expired_
+            # signature", "context": {...}}} — NOT a 401/403. Proof: every
+            # "API CREDENTIALS INVALID" log line in production shows
+            # verify_api_credentials() hitting its "Delta explicitly
+            # rejected the credentials: {result}" branch, which only runs
+            # when _signed_request returned a parsed dict (a 2xx response),
+            # never when it returned None or raised. That means this whole
+            # resync-and-retry mechanism — built and tested below for the
+            # 401/403 case — silently never ran for the single most common
+            # real-world failure, and every dashboard symptom downstream of
+            # it (balance "Unavailable", "API Credentials: CHECK") traces
+            # back to this one gap.
+            if isinstance(result, dict) and result.get("success") is False and not resynced_once:
+                err_code = str((result.get("error") or {}).get("code", ""))
+                if _looks_like_signature_issue(err_code):
+                    resynced_once = True
+                    log.warning(f"🕒 Signed request got a 200-OK rejection that looks like a clock/signature "
+                                f"issue ({err_code}) — resyncing and retrying this request once.")
+                    if not _apply_drift_correction_from_body(result):
+                        sync_time_with_delta(retries=1)
+                    timestamp = str(int(synced_timestamp_ms() / 1000))
+                    headers = _build_headers(timestamp)
+                    continue
+            return result
         except requests.exceptions.RequestException as e:
             last_err = e
             body = getattr(e.response, "text", "") if hasattr(e, "response") and e.response is not None else ""
@@ -2000,46 +2092,18 @@ def _signed_request(method: str, path: str, payload_dict: Dict = None) -> Option
                 # retry exactly once. Bounded to once per call (resynced_once)
                 # so a genuinely bad key can't loop forever pretending to be
                 # a clock problem.
-                looks_like_signature_issue = any(
-                    tok in body.lower() for tok in ("expired_signature", "signature", "timestamp")
-                )
-                if looks_like_signature_issue and not resynced_once:
+                if _looks_like_signature_issue(body) and not resynced_once:
                     resynced_once = True
-                    # [CRITICAL FIX v2 — the resync-against-/v2/products fix
-                    # didn't actually solve this in production: logs showed
-                    # the SAME ~59s gap persisting on the retry even right
-                    # after a resync. Root cause: /v2/products' HTTP `Date`
-                    # header can be served by a different edge/CDN node than
-                    # the one that actually validates the HMAC signature, so
-                    # syncing against it corrects drift relative to the WRONG
-                    # clock. Delta's own 401 error body already hands us the
-                    # exact clock that validates signatures directly —
-                    # {"error":{"context":{"server_time":...}}} — so use THAT
-                    # authoritative value first, and only fall back to the
-                    # products-endpoint resync if the error body doesn't have
-                    # it (e.g. a 401 for a totally different reason).
-                    used_authoritative_time = False
                     try:
                         err_json = json.loads(body)
-                        auth_server_time = err_json.get("error", {}).get("context", {}).get("server_time")
-                        if auth_server_time is not None:
-                            with _time_drift_lock:
-                                _time_drift_ms = float(auth_server_time) * 1000 - time.time() * 1000
-                            log.warning(f"🕒 Corrected clock drift using Delta's own signing-server "
-                                        f"time from this error's response ({auth_server_time}) — more "
-                                        f"authoritative than /v2/products' Date header for this purpose.")
-                            used_authoritative_time = True
                     except Exception:
-                        pass
-                    if not used_authoritative_time:
+                        err_json = {}
+                    if not _apply_drift_correction_from_body(err_json):
                         log.warning("🕒 401 looks like a signature/timestamp issue — resyncing clock and "
                                     "retrying this request once with a corrected timestamp.")
                         sync_time_with_delta(retries=1)
                     timestamp = str(int(synced_timestamp_ms() / 1000))
-                    sig_msg = method.upper() + timestamp + path + payload
-                    signature = hmac.new(API_SECRET.encode(), sig_msg.encode(), hashlib.sha256).hexdigest()
-                    headers = {"api-key": API_KEY, "timestamp": timestamp, "signature": signature,
-                               "Content-Type": "application/json", "User-Agent": DELTA_USER_AGENT}
+                    headers = _build_headers(timestamp)
                     continue
                 break
             if attempt < MAX_RETRIES:
@@ -3604,11 +3668,10 @@ button{font-family:inherit;}
 .settings-row .k{color:var(--text-mid);}
 .settings-row .v{color:var(--text-hi);font-weight:600;font-family:var(--font-display);font-size:11.5px;text-align:right;}
 .settings-row .v.on{color:var(--lime);} .settings-row .v.off{color:var(--text-dim);} .settings-row .v.danger{color:var(--coral);}
-.signal-tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;margin:2px 3px 0 0;background:rgba(157,255,31,.1);color:var(--lime-soft);border:1px solid rgba(157,255,31,.25);cursor:pointer;user-select:none;transition:transform .1s ease,opacity .1s ease;}
+.signal-tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;margin:2px 3px 0 0;background:rgba(157,255,31,.1);color:var(--lime-soft);border:1px solid rgba(157,255,31,.25);}
 .signal-tag.off{background:rgba(255,255,255,.03);color:var(--text-dim);border-color:var(--panel-border);}
-.signal-tag:active{transform:scale(.9);}
-.settings-row.tappable{cursor:pointer;transition:opacity .1s ease;}
-.settings-row.tappable:active{opacity:.55;}
+.signal-tag-btn{cursor:pointer;font-family:var(--font-body);appearance:none;-webkit-appearance:none;transition:transform .08s ease;}
+.signal-tag-btn:active{transform:scale(.94);}
 
 .stat-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .stat-mini{background:rgba(255,255,255,.02);border:1px solid var(--panel-border);border-radius:10px;padding:11px 12px;}
@@ -4413,6 +4476,21 @@ button{font-family:inherit;}
     </div>
   </section>
 
+  <!-- [PHASE 4 — Multi-Broker] Additive tab: does not touch or replace any
+       existing view above. Shows whichever broker is currently active
+       (Delta today, Zerodha/others once configured) through the new
+       broker-agnostic /broker/* endpoints, so this tab needs no changes
+       when a second broker actually goes live later. -->
+  <section class="tab-view" id="view-broker" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title"><svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>Multi-Broker Control</span>
+        <span class="count-pill" data-modepill id="brokerMode">Demo</span>
+      </div>
+      <div id="brokerBody"><div class="tab-empty">Loading…</div></div>
+    </div>
+  </section>
+
   <!-- ================= CONFIRM MODAL (shared by any destructive action) ================= -->
   <div class="confirm-overlay" id="confirmOverlay">
     <div class="confirm-card">
@@ -4452,6 +4530,10 @@ button{font-family:inherit;}
       <button class="nav-item" data-nav="settings">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="23"/><line x1="1" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="23" y2="12"/><line x1="4.2" y1="4.2" x2="6.3" y2="6.3"/><line x1="17.7" y1="17.7" x2="19.8" y2="19.8"/><line x1="4.2" y1="19.8" x2="6.3" y2="17.7"/><line x1="17.7" y1="6.3" x2="19.8" y2="4.2"/></svg>
         <span class="nav-item-text"><span class="nav-title">System Settings</span><span class="nav-sub">Configuration</span></span>
+      </button>
+      <button class="nav-item" data-nav="broker">
+        <svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+        <span class="nav-item-text"><span class="nav-title">Multi-Broker</span><span class="nav-sub">Broker Control</span></span>
       </button>
     </div>
     <button class="nav-arrow" id="navRight" aria-label="scroll right"><svg viewBox="0 0 24 24"><polyline points="9,6 15,12 9,18"/></svg></button>
@@ -4663,10 +4745,12 @@ function confirmAction(title, body, onConfirm){
   cancelBtn.addEventListener('click', onCancel);
   overlay.addEventListener('click', onBackdrop);
 }
-async function callControl(action){
+async function callControl(action, params){
   if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
   try{
-    const res = await fetch(LIVE.baseUrl + '/control/' + encodeURIComponent(LIVE.key) + '/' + action, { cache:'no-store' });
+    let url = LIVE.baseUrl + '/control/' + encodeURIComponent(LIVE.key) + '/' + action;
+    if(params){ url += '?' + new URLSearchParams(params).toString(); }
+    const res = await fetch(url, { cache:'no-store' });
     const body = await res.json().catch(()=>({}));
     if(!res.ok){
       showToast('Action failed: ' + (body.error || res.status) + (res.status===403 ? ' — if APEX_CONTROL_PASSWORD is set separately on your bot, your connect key won\'t match it.' : ''));
@@ -4675,39 +4759,18 @@ async function callControl(action){
     return body;
   }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
 }
-// [PREMIUM FIX — LIVE/DRY-RUN + SIGNAL TIER CONTROLS] The backend has had
-// /mode/<secret> and /signals/<secret> for a while, but nothing in this
-// dashboard ever called them — Mode was rendered as a read-only label and
-// signal tiers weren't shown at all outside Settings, where they were also
-// just static tags. These three helpers follow the exact same shape as
-// callControl() above (GET-with-query, same error toast, same "not
-// connected" guard) so every button below behaves identically to the ones
-// that already worked.
-async function callMode(liveBool){
+// [DASHBOARD NEW] /mode and /signals are real, working control endpoints on
+// main.py (see /mode/<secret> and /signals/<secret>) but sit at their own
+// path, not under /control/<key>/... like the buttons above — this is the
+// same idea as callControl, just for those two.
+async function callBotRoute(routeBase, params){
   if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
   try{
-    const res = await fetch(LIVE.baseUrl + '/mode/' + encodeURIComponent(LIVE.key) + '?live_mode=' + (liveBool?'true':'false'), { cache:'no-store' });
+    let url = LIVE.baseUrl + routeBase + '/' + encodeURIComponent(LIVE.key);
+    if(params){ url += '?' + new URLSearchParams(params).toString(); }
+    const res = await fetch(url, { cache:'no-store' });
     const body = await res.json().catch(()=>({}));
-    if(!res.ok){ showToast('Mode change failed: ' + (body.error || res.status)); return null; }
-    return body;
-  }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
-}
-async function callSignalTier(tier, enable){
-  if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
-  try{
-    const qp = (enable ? 'enable=' : 'disable=') + encodeURIComponent(tier);
-    const res = await fetch(LIVE.baseUrl + '/signals/' + encodeURIComponent(LIVE.key) + '?' + qp, { cache:'no-store' });
-    const body = await res.json().catch(()=>({}));
-    if(!res.ok){ showToast('Signal tier update failed: ' + (body.error || res.status)); return null; }
-    return body;
-  }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
-}
-async function callRiskSizing(enabledBool){
-  if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
-  try{
-    const res = await fetch(LIVE.baseUrl + '/control/' + encodeURIComponent(LIVE.key) + '/risk-sizing?enabled=' + (enabledBool?'true':'false'), { cache:'no-store' });
-    const body = await res.json().catch(()=>({}));
-    if(!res.ok){ showToast('Risk sizing update failed: ' + (body.error || res.status)); return null; }
+    if(!res.ok){ showToast('Action failed: ' + (body.error || res.status)); return null; }
     return body;
   }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
 }
@@ -4723,15 +4786,15 @@ function renderAutopilotTab(){
   }
   const cfg = LIVECACHE.config || {};
   const paused = !!cfg.paused, killed = !!cfg.kill_switch_active, live = !!cfg.live_mode;
+  const riskSizing = !!cfg.risk_based_sizing;
   const cb = cfg.circuit_breaker || {};
+  const activeSignals = new Set((cfg.active_signals||[]).map(s=>s.toUpperCase()));
+  const allSignals = cfg.all_known_signals || cfg.active_signals || [];
   let bannerClass='ok', bannerText = live ? 'LIVE — placing real orders' : 'DRY RUN — no real orders sent';
   if(paused){ bannerClass='paused'; bannerText='PAUSED — no new entries will be taken'; }
   if(killed){ bannerClass='danger'; bannerText='KILL SWITCH ARMED — all new entries blocked'; }
   body.innerHTML =
     '<div class="status-banner '+bannerClass+'"><span class="status-dot"></span>'+bannerText+'</div>'+
-    '<div class="act-row">'+
-      '<button class="act-btn '+(live?'warn':'primary')+'" id="btnModeToggle">'+(live?'Switch to Dry Run':'Go Live')+'<span class="sub">'+(live?'Simulate only — nothing hits the exchange':'Start placing REAL orders on Delta')+'</span></button>'+
-    '</div>'+
     '<div class="act-row">'+
       '<button class="act-btn primary" id="btnResume" '+(!paused?'disabled':'')+'>Resume Trading<span class="sub">Allow new entries again</span></button>'+
       '<button class="act-btn warn" id="btnPause" '+(paused?'disabled':'')+'>Pause<span class="sub">Block new entries · open trades keep running</span></button>'+
@@ -4740,10 +4803,20 @@ function renderAutopilotTab(){
       '<button class="act-btn '+(killed?'primary':'danger')+'" id="btnKill">'+(killed?'Disarm Kill Switch':'Arm Kill Switch')+'<span class="sub">'+(killed?'Resume normal operation':'Blocks new entries until manually reset')+'</span></button>'+
       '<button class="act-btn danger" id="btnCloseAll">Close All Positions<span class="sub">Market-close every open trade now</span></button>'+
     '</div>'+
+    '<div class="act-row">'+
+      '<button class="act-btn '+(live?'warn':'primary')+'" id="btnModeToggle">'+(live?'Switch to DRY RUN':'Go LIVE')+'<span class="sub">'+(live?'Stop placing real orders — simulate only':'Starts placing REAL orders with real money')+'</span></button>'+
+      '<button class="act-btn '+(riskSizing?'primary':'warn')+'" id="btnRiskSizing">'+(riskSizing?'Risk Sizing: ON':'Risk Sizing: OFF')+'<span class="sub">Position size from account balance × risk% instead of a fixed qty</span></button>'+
+    '</div>'+
     '<div class="panel" style="padding:14px;margin-top:2px;">'+
       '<div class="settings-row"><span class="k">Circuit Breaker</span><span class="v '+(cb.tripped?'danger':'on')+'">'+(cb.tripped?'TRIPPED':'Clear')+'</span></div>'+
       '<div class="settings-row"><span class="k">Consecutive Losses</span><span class="v">'+(cb.consecutive_losses ?? '—')+' / '+(cb.max_consecutive_losses ?? '—')+'</span></div>'+
       '<div class="settings-row"><span class="k">Mode</span><span class="v '+(live?'danger':'on')+'">'+(live?'LIVE (real orders)':'DRY RUN (simulated)')+'</span></div>'+
+    '</div>'+
+    '<div class="panel" style="padding:14px;margin-top:10px;">'+
+      '<div class="panel-title" style="margin-bottom:8px;font-size:10.5px;">Active Signal Tiers — tap to enable/disable which signals this bot trades</div>'+
+      '<div id="tierChips">'+allSignals.map(s=>
+        '<button type="button" class="signal-tag signal-tag-btn '+(activeSignals.has(s.toUpperCase())?'':'off')+'" data-tier="'+s+'">'+s+'</button>').join('')+
+      '</div>'+
     '</div>';
   document.getElementById('btnPause').onclick = ()=> confirmAction('Pause trading?',
     'No new entries will be taken until you resume. Positions already open keep running with their normal SL/TP/trailing logic — pausing does not touch them.',
@@ -4765,13 +4838,25 @@ function renderAutopilotTab(){
     async ()=>{ const r = await callControl('close-all'); if(r){ showToast('Close-all sent.'); await pollLive(); renderAutopilotTab(); } });
   document.getElementById('btnModeToggle').onclick = ()=>{
     if(live){
-      (async ()=>{ const r = await callMode(false); if(r){ showToast('Switched to DRY RUN — simulated orders only.'); await pollLive(); renderAutopilotTab(); if(document.getElementById('view-settings') && !document.getElementById('view-settings').hidden) renderSettingsTab(); } })();
+      confirmAction('Switch to DRY RUN?', 'The bot will stop placing real orders on Delta and only simulate them. Any positions already open on the exchange are NOT closed by this — use Close All separately if you want that.',
+        async ()=>{ const r = await callBotRoute('/mode', {live_mode:'false'}); if(r){ showToast('Switched to DRY RUN.'); await pollLive(); renderAutopilotTab(); } });
     } else {
-      confirmAction('Go LIVE?',
-        'This switches the bot to placing REAL orders with real money on your connected exchange account. Double-check position sizing and active signal tiers first — Close All and Kill Switch still work independently if something goes wrong.',
-        async ()=>{ const r = await callMode(true); if(r){ showToast('LIVE — placing real orders now.'); await pollLive(); renderAutopilotTab(); if(document.getElementById('view-settings') && !document.getElementById('view-settings').hidden) renderSettingsTab(); } });
+      confirmAction('Go LIVE?', 'The bot will start placing REAL orders with real money on Delta Exchange immediately. Make sure your API key, risk settings, and active signal tiers below are exactly what you want before confirming.',
+        async ()=>{ const r = await callBotRoute('/mode', {live_mode:'true'}); if(r){ showToast('LIVE mode enabled.'); await pollLive(); renderAutopilotTab(); } });
     }
   };
+  document.getElementById('btnRiskSizing').onclick = async ()=>{
+    const r = await callControl('risk-sizing', {enabled: (!riskSizing).toString()});
+    if(r){ showToast('Risk-based sizing turned ' + (!riskSizing ? 'ON' : 'OFF') + '.'); await pollLive(); renderAutopilotTab(); }
+  };
+  document.querySelectorAll('#tierChips .signal-tag-btn').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const tier = btn.dataset.tier;
+      const isOn = !btn.classList.contains('off');
+      const r = await callBotRoute('/signals', isOn ? {disable: tier} : {enable: tier});
+      if(r){ showToast(tier + ' ' + (isOn ? 'disabled' : 'enabled') + '.'); await pollLive(); renderAutopilotTab(); }
+    };
+  });
 }
 
 function renderVaultTab(){
@@ -4912,53 +4997,81 @@ function renderSettingsTab(){
   if(!c){ body.innerHTML = '<div class="tab-empty">Loading configuration…</div>'; return; }
   const flag = (label,on) => '<div class="settings-row"><span class="k">'+label+'</span><span class="v '+(on?'on':'off')+'">'+(on?'ON':'OFF')+'</span></div>';
   const active = new Set((c.active_signals||[]).map(s=>s.toUpperCase()));
-  const tags = (c.all_known_signals||c.active_signals||[]).map(s=>{
-    const isOn = active.has(s.toUpperCase());
-    return '<span class="signal-tag '+(isOn?'':'off')+'" data-tier="'+s+'" data-on="'+(isOn?'1':'0')+'">'+s+'</span>';
-  }).join('') || '—';
+  const tags = (c.all_known_signals||c.active_signals||[]).map(s=>
+    '<span class="signal-tag '+(active.has(s.toUpperCase())?'':'off')+'">'+s+'</span>').join('') || '—';
   const td = c.time_drift || {};
   body.innerHTML =
     '<div class="settings-row"><span class="k">Region</span><span class="v">'+(c.region||'—')+'</span></div>'+
-    '<div class="settings-row tappable" id="settingsModeRow"><span class="k">Mode <span style="opacity:.5;font-size:9px;">(tap to switch)</span></span><span class="v '+(c.live_mode?'danger':'on')+'">'+(c.live_mode?'LIVE':'DRY RUN')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Mode</span><span class="v '+(c.live_mode?'danger':'on')+'">'+(c.live_mode?'LIVE':'DRY RUN')+'</span></div>'+
     '<div class="settings-row"><span class="k">Paused</span><span class="v '+(c.paused?'off':'on')+'">'+(c.paused?'YES':'NO')+'</span></div>'+
     '<div class="settings-row"><span class="k">Kill Switch</span><span class="v '+(c.kill_switch_active?'danger':'on')+'">'+(c.kill_switch_active?'ARMED':'clear')+'</span></div>'+
     '<div class="settings-row"><span class="k">Auto Bracket Orders</span><span class="v '+(c.auto_bracket_orders?'on':'off')+'">'+(c.auto_bracket_orders?'ON':'OFF')+'</span></div>'+
     '<div class="settings-row"><span class="k">API Credentials</span><span class="v '+(c.api_credentials_ok?'on':'danger')+'">'+(c.api_credentials_ok?'OK':'CHECK')+'</span></div>'+
     '<div class="settings-row"><span class="k">Products Discovered</span><span class="v">'+(c.products_discovered ?? '—')+'</span></div>'+
     '<div class="settings-row"><span class="k">Clock Drift</span><span class="v '+((td.drift_ms==null||Math.abs(td.drift_ms)<1000)?'on':'danger')+'">'+(td.drift_ms!=null?Math.round(td.drift_ms)+'ms':'—')+'</span></div>'+
-    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Signal Tiers <span style="opacity:.5;font-weight:400;text-transform:none;">(tap to enable/disable)</span></div>'+
+    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Signal Tiers</div>'+
     '<div>'+tags+'</div>'+
     '<div class="panel-title" style="margin:18px 0 2px;font-size:10.5px;">Feature Flags</div>'+
     flag('HFT Parallel Exits', c.hft_parallel_exits) +
     flag('Predator Vision', c.predator_vision_enabled) +
-    '<div class="settings-row tappable" id="riskSizingRow"><span class="k">Risk-Based Sizing <span style="opacity:.5;font-size:9px;">(tap to toggle)</span></span><span class="v '+(c.risk_based_sizing?'on':'off')+'">'+(c.risk_based_sizing?'ON':'OFF')+'</span></div>'+
+    flag('Risk-Based Sizing', c.risk_based_sizing) +
     flag('Aggressive Exits', c.aggressive_exits_enabled) +
     flag('Neural Syndicate', c.neural_syndicate_enabled) +
     flag('Shock Entry Block', c.block_entries_during_shock) +
     flag('Telegram Alerts', c.telegram_enabled) +
-    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">Mode, Active Signal Tiers and Risk-Based Sizing above are live — tap any of them to change it right now. Everything else on this screen is boot-time only: changing it means an env var + redeploy, not a toggle here, so it can\'t silently drift from what\'s actually running.</div>';
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">This screen mirrors your bot\'s real /config response. Mode, Kill Switch, Pause, Risk-Based Sizing, and Active Signal Tiers can be changed live from the <b style="color:var(--text-mid);">Autopilot</b> tab — no redeploy needed. The Feature Flags below this line are boot-time env vars only; changing those still needs an env var edit + restart.</div>';
+}
 
-  const modeRow = document.getElementById('settingsModeRow');
-  if(modeRow) modeRow.onclick = ()=>{
-    if(c.live_mode){
-      (async ()=>{ const r = await callMode(false); if(r){ showToast('Switched to DRY RUN.'); await pollLive(); renderSettingsTab(); if(document.getElementById('view-autopilot') && !document.getElementById('view-autopilot').hidden) renderAutopilotTab(); } })();
-    } else {
-      confirmAction('Go LIVE?',
-        'This switches the bot to placing REAL orders with real money on your connected exchange account.',
-        async ()=>{ const r = await callMode(true); if(r){ showToast('LIVE — placing real orders now.'); await pollLive(); renderSettingsTab(); if(document.getElementById('view-autopilot') && !document.getElementById('view-autopilot').hidden) renderAutopilotTab(); } });
-    }
-  };
-  const riskRow = document.getElementById('riskSizingRow');
-  if(riskRow) riskRow.onclick = async ()=>{
-    const r = await callRiskSizing(!c.risk_based_sizing);
-    if(r){ showToast('Risk-based sizing turned '+(r.risk_based_sizing?'ON':'OFF')+'.'); await pollLive(); renderSettingsTab(); }
-  };
-  body.querySelectorAll('.signal-tag[data-tier]').forEach(el=>{
-    el.onclick = async ()=>{
-      const tier = el.dataset.tier, isOn = el.dataset.on === '1';
-      const r = await callSignalTier(tier, !isOn);
-      if(r){ showToast(tier + ' ' + (isOn?'disabled':'enabled') + '.'); await pollLive(); renderSettingsTab(); }
-    };
+// [PHASE 4 — Multi-Broker] Reads only the new broker-agnostic endpoints
+// (/broker/status, /broker/balance, /broker/health) — this function needs
+// no changes when a second broker (Zerodha, etc.) actually goes live later,
+// since those endpoints already return the same shape regardless of which
+// broker produced them.
+async function renderBrokerTab(){
+  const body = document.getElementById('brokerBody');
+  if(!LIVE.enabled){
+    body.innerHTML = '<div class="tab-empty"><svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>'+
+      'Connect your live bot to see and switch between whichever brokers it has configured.'+
+      '<button class="connect-cta" type="button" id="brokerConnectCta">Connect Now</button></div>';
+    document.getElementById('brokerConnectCta').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
+    return;
+  }
+  const [status, balance, health] = await Promise.all([
+    liveFetch('/broker/status'), liveFetch('/broker/balance'), liveFetch('/broker/health')
+  ]);
+  if(!status){
+    body.innerHTML = '<div class="tab-empty">Could not reach /broker/status — this bot build may predate the multi-broker layer.</div>';
+    return;
+  }
+  const rows = (status.registered||[]).map(b=>{
+    const isActive = b.name === status.active;
+    const switchBtn = isActive ? '' :
+      ' <button class="connect-cta" type="button" style="padding:3px 10px;font-size:10px;margin-left:6px;" data-switch-broker="'+b.name+'">Switch</button>';
+    return '<div class="settings-row"><span class="k">'+b.name.toUpperCase()+(isActive?' · active':'')+'</span>'+
+      '<span class="v '+(b.configured?'on':'off')+'">'+(b.configured?'configured':'not configured')+switchBtn+'</span></div>';
+  }).join('') || '<div class="tab-empty">No brokers registered on this bot.</div>';
+
+  const balRow = (balance && !balance.error)
+    ? '<div class="settings-row"><span class="k">Balance ('+balance.broker+')</span><span class="v">'+Number(balance.cash).toFixed(2)+' '+balance.currency+'</span></div>'
+    : '<div class="settings-row"><span class="k">Balance</span><span class="v off">unavailable</span></div>';
+
+  const h = health || {};
+  const db = h.database || {}, api = h.delta_api || {}, cb = h.circuit_breaker || {};
+  const healthRows =
+    '<div class="settings-row"><span class="k">Database</span><span class="v '+(db.ok?'on':'danger')+'">'+(db.ok?'OK':'FAIL')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Broker API</span><span class="v '+(api.ok?'on':'danger')+'">'+(api.ok?'OK':'FAIL')+'</span></div>'+
+    '<div class="settings-row"><span class="k">Circuit Breaker</span><span class="v '+(cb.tripped?'danger':'on')+'">'+(cb.tripped?'TRIPPED':'clear')+'</span></div>';
+
+  body.innerHTML =
+    '<div class="panel-title" style="margin:0 0 6px;font-size:10.5px;">Registered Brokers</div>'+rows+
+    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Broker</div>'+balRow+
+    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Health</div>'+healthRows+
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">This tab reads the same broker-agnostic endpoints no matter which broker is active — no dashboard change is needed when a second broker actually goes live.</div>';
+
+  body.querySelectorAll('[data-switch-broker]').forEach(btn=>{
+    btn.onclick = ()=> confirmAction('Switch active broker to '+btn.dataset.switchBroker.toUpperCase()+'?',
+      'Changes which broker this Broker tab (status/balance/position) reads from. Live webhook signals do NOT route through this switch yet — they still call Delta directly, so this alone will not move real trading to a different broker.',
+      async ()=>{ const r = await callControl('broker/switch/'+btn.dataset.switchBroker); if(r){ showToast(r.detail || 'Switched.'); renderBrokerTab(); } });
   });
 }
 
@@ -5671,11 +5784,25 @@ function jitterFooter(){
   document.getElementById('stat-srvlatency').textContent = state.srvLatency+'ms';
 }
 function tick(){
-  jitterPrices(); jitterAccount(); jitterLatencies(); jitterFooter(); jitterPositions();
+  if(!LIVE.enabled){
+    // [CRITICAL FIX] These are the "impressive while nobody's connected yet"
+    // cosmetic simulators. Once a real bot is connected, pollLive() (below)
+    // already fetches and sets the real balance/prices/positions/trades
+    // every cycle — running these on top of that was overwriting the real,
+    // steady account balance with a random walk every 2.6s (including
+    // occasionally going negative, since jitterAccount() has no floor),
+    // which is exactly why the dashboard's Total Balance / prices looked
+    // like they were randomly bouncing around instead of matching Delta.
+    jitterPrices(); jitterAccount(); jitterPositions();
+    if(Math.random() < 0.32) addSyntheticTrade();
+    if(Math.random() < 0.16) addSyntheticNews();
+  }
+  // Exchange-latency list and AI Core Load intentionally stay illustrative
+  // even once live — main.py has no real feed for either of these (see the
+  // connect panel's own copy above) — so these two keep running regardless.
+  jitterLatencies(); jitterFooter();
   if(chartState.liveCandles){ loadCandles(chartState.tf); } else { tickChart(); }
   pollLive();
-  if(Math.random() < 0.32) addSyntheticTrade();
-  if(Math.random() < 0.16) addSyntheticNews();
 }
 
 function tickUptime(){
@@ -5815,12 +5942,12 @@ document.querySelectorAll('.say-item').forEach(el=>{
 /* ================================================================
    NAV / TOAST
    ================================================================ */
-const NAV_LABELS = { dashboard:'Dashboard', strategy:'Strategy Lab', backtest:'Backtest Engine', vault:'Portfolio Vault', autopilot:'Autopilot', settings:'System Settings' };
+const NAV_LABELS = { dashboard:'Dashboard', strategy:'Strategy Lab', backtest:'Backtest Engine', vault:'Portfolio Vault', autopilot:'Autopilot', settings:'System Settings', broker:'Multi-Broker' };
 // [REAL TABS ADD] These 4 now have real content wired to real endpoints —
 // only 'strategy' still has no backend concept (the bot runs one signal
 // system, not multiple selectable strategies) so it keeps the honest toast.
-const REAL_TABS = ['dashboard','autopilot','vault','backtest','settings'];
-const TAB_RENDERERS = { autopilot: ()=>renderAutopilotTab(), vault: ()=>renderVaultTab(), backtest: ()=>renderBacktestTab(), settings: ()=>renderSettingsTab() };
+const REAL_TABS = ['dashboard','autopilot','vault','backtest','settings','broker'];
+const TAB_RENDERERS = { autopilot: ()=>renderAutopilotTab(), vault: ()=>renderVaultTab(), backtest: ()=>renderBacktestTab(), settings: ()=>renderSettingsTab(), broker: ()=>renderBrokerTab() };
 function setActiveNav(key){
   if(!REAL_TABS.includes(key)){
     showToast(NAV_LABELS[key] + ' module is queued for the next build phase, Master.');
@@ -7246,6 +7373,67 @@ class AppConfig:
         }
 
 
+# ---- Unified Data Layer (Roadmap Phase 1) ------------------------------------
+# Crypto (Delta) and index F&O (Zerodha, later) return completely different
+# shapes — different symbol formats, different currencies, different balance
+# fields. Every broker adapter below normalizes its raw response into ONE of
+# these dataclasses, so the dashboard and any future route can read broker
+# data without caring which broker produced it. Nothing existing reads these
+# yet — they are additive, new-only structures with their own new routes.
+@dataclass(frozen=True)
+class UnifiedSymbol:
+    broker: str
+    raw_symbol: str
+    display_name: str
+    asset_class: str          # e.g. "crypto_perp", "index_future", "index_option"
+    tick_size: Optional[float] = None
+    lot_size: int = 1
+    currency: str = "USD"
+
+
+@dataclass(frozen=True)
+class UnifiedBalance:
+    broker: str
+    currency: str
+    cash: float
+    margin_used: float = 0.0
+    margin_available: float = 0.0
+
+
+@dataclass(frozen=True)
+class UnifiedPosition:
+    broker: str
+    symbol: str
+    quantity: float
+    avg_price: float
+    direction: str             # "LONG" / "SHORT" / "FLAT"
+    unrealized_pnl: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class UnifiedCandle:
+    broker: str
+    symbol: str
+    timeframe: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    timestamp: str
+
+
+@dataclass(frozen=True)
+class UnifiedOrder:
+    broker: str
+    order_id: str
+    symbol: str
+    status: str
+    side: str
+    quantity: float
+    filled_price: Optional[float] = None
+
+
 # ---- Broker Adapter Layer ----------------------------------------------------
 class BrokerAdapter(ABC):
     """Common interface every broker integration exposes. Delta is the only
@@ -7275,6 +7463,43 @@ class BrokerAdapter(ABC):
 
     @abstractmethod
     def is_configured(self) -> bool: ...
+
+    # -- Unified accessors: concrete (non-abstract) default implementations.
+    # DeltaBroker gets these for free via inheritance, with zero code changes,
+    # because they're built purely on the abstract methods above. A future
+    # ZerodhaBroker can override either one for richer normalization (e.g.
+    # real margin_used/margin_available, INR currency) without touching this
+    # base class or DeltaBroker.
+    def get_unified_balance(self) -> Optional[UnifiedBalance]:
+        bal = self.get_balance()
+        if bal is None:
+            return None
+        return UnifiedBalance(broker=self.name, currency="USD", cash=float(bal))
+
+    def get_unified_position(self, symbol: str) -> Optional[UnifiedPosition]:
+        pos = self.get_position(symbol)
+        if not pos:
+            return UnifiedPosition(broker=self.name, symbol=symbol, quantity=0.0,
+                                    avg_price=0.0, direction="FLAT")
+        qty = float(pos.get("quantity", pos.get("qty", 0)) or 0)
+        return UnifiedPosition(
+            broker=self.name, symbol=symbol, quantity=qty,
+            avg_price=float(pos.get("avg_price", pos.get("entry_price", 0)) or 0),
+            direction="LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT"),
+            unrealized_pnl=pos.get("unrealized_pnl"),
+        )
+
+    # -- Feed lifecycle (Roadmap Phase 3): optional hooks for brokers that
+    # need a background connection (e.g. a websocket ticker). Default is a
+    # no-op, so Delta and any broker without a live feed need zero code here
+    # — only BrokerManager.switch() ever calls these, and always inside a
+    # try/except, so a broker that raises can't break switching for itself
+    # or for any other registered broker.
+    def start_feed(self):
+        pass
+
+    def stop_feed(self):
+        pass
 
 
 class DeltaBroker(BrokerAdapter):
@@ -7325,11 +7550,34 @@ class BrokerManager:
                 self._active = broker.name
 
     def switch(self, name: str) -> Tuple[bool, str]:
+        """Phase 3 safe-switch: stop the previous broker's feed (if any),
+        start the new one's, both wrapped so a hang/crash in either can
+        never take down the switch itself or the other broker. Feed
+        start/stop happen OUTSIDE the lock so a slow feed call can't block
+        status()/active() reads from other threads (dashboard polling)."""
         with self._lock:
             if name not in self._brokers:
                 return False, f"unknown broker '{name}' — registered: {list(self._brokers)}"
+            old_name = self._active
+            old_broker = self._brokers.get(old_name) if old_name else None
+            new_broker = self._brokers[name]
+
+        if old_broker is not None and old_broker is not new_broker:
+            try:
+                old_broker.stop_feed()
+            except Exception as e:
+                log.error(f"BrokerManager.switch: stop_feed failed for '{old_name}' "
+                          f"(continuing anyway): {e}")
+
+        try:
+            new_broker.start_feed()
+        except Exception as e:
+            log.error(f"BrokerManager.switch: start_feed failed for '{name}': {e}")
+            return False, f"switch aborted — '{name}'.start_feed() failed: {e}"
+
+        with self._lock:
             self._active = name
-            return True, f"active broker switched to '{name}'"
+        return True, f"active broker switched to '{name}'"
 
     def active(self) -> Optional[BrokerAdapter]:
         with self._lock:
@@ -7346,6 +7594,410 @@ class BrokerManager:
 
 broker_manager = BrokerManager()
 broker_manager.register(DeltaBroker(), make_active=True)
+
+
+# ---- NSE Market Hours Guard (Roadmap Phase 2, tested — pure date/time logic,
+# no external dependency) --------------------------------------------------
+NSE_MARKET_OPEN = dtime(9, 15)
+NSE_MARKET_CLOSE = dtime(15, 30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def is_nse_market_open(now: Optional[datetime] = None) -> bool:
+    """Nifty/Bank Nifty trade only Mon-Fri, 9:15-15:30 IST. This does NOT
+    account for NSE holidays (Diwali, Republic Day, special settlement days,
+    etc.) — plug in a real holiday calendar before relying on this to gate
+    live orders. Pure date/time logic, so unlike the broker calls below this
+    IS fully testable without any Zerodha credentials."""
+    now = (now or datetime.now(timezone.utc)).astimezone(IST)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    t = now.time()
+    return NSE_MARKET_OPEN <= t <= NSE_MARKET_CLOSE
+
+
+# ---- Zerodha Adapter (Roadmap Phase 2) ---------------------------------------
+# ⚠️ UNTESTED — no live Zerodha/Kite Connect credentials were available while
+# writing this. The Delta adapter above was verified end-to-end with a mocked
+# API and a real Flask test client; this class has NOT had the same
+# verification because it cannot run without real credentials. Treat it as a
+# reviewed first draft, not a merged/tested feature — confirm on a real (or
+# small-size) account before routing live signals through it.
+#
+# Handles three Zerodha-specific realities the roadmap flagged:
+#  1. Daily re-auth: access_token expires ~7:30am IST every day. Kite Connect
+#     has no official refresh-token flow — a separate scheduled job (not
+#     included here) must complete the login flow and update
+#     ZERODHA_ACCESS_TOKEN daily, then this process needs a restart or a
+#     live token-swap endpoint (not yet built).
+#  2. No native bracket orders: SEBI banned BO in 2020. place_bracket_order()
+#     places a plain entry order only; SL/TP enforcement needs a monitor
+#     loop (like the existing Delta position-monitor loop) watching
+#     get_last_price() against the levels — that loop is not built yet.
+#  3. Instrument tokens: Zerodha needs a numeric instrument_token, not a
+#     plain symbol string. resolve_product() looks it up from a daily-cached
+#     instrument dump.
+try:
+    from kiteconnect import KiteConnect
+    _KITECONNECT_AVAILABLE = True
+except ImportError:
+    KiteConnect = None
+    _KITECONNECT_AVAILABLE = False
+
+ZERODHA_API_KEY = os.environ.get("ZERODHA_API_KEY", "")
+ZERODHA_API_SECRET = os.environ.get("ZERODHA_API_SECRET", "")
+ZERODHA_ACCESS_TOKEN = os.environ.get("ZERODHA_ACCESS_TOKEN", "")
+
+
+class ZerodhaBroker(BrokerAdapter):
+    name = "zerodha"
+
+    def __init__(self):
+        self._kite = None
+        self._instruments_cache: Dict[str, Dict] = {}
+        self._instruments_loaded_at = 0.0
+        if _KITECONNECT_AVAILABLE and ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN:
+            try:
+                self._kite = KiteConnect(api_key=ZERODHA_API_KEY)
+                self._kite.set_access_token(ZERODHA_ACCESS_TOKEN)
+            except Exception as e:
+                log.error(f"ZerodhaBroker init failed: {e}")
+                self._kite = None
+
+    def is_configured(self) -> bool:
+        return self._kite is not None
+
+    def _ensure_instruments(self):
+        if self._instruments_cache and (time.time() - self._instruments_loaded_at) < 86400:
+            return
+        try:
+            rows = self._kite.instruments("NFO")
+            self._instruments_cache = {r.get("tradingsymbol", "").upper(): r for r in rows}
+            self._instruments_loaded_at = time.time()
+        except Exception as e:
+            log.error(f"Zerodha instrument refresh failed: {e}")
+
+    def resolve_product(self, symbol: str) -> Optional[int]:
+        if not self._kite:
+            return None
+        self._ensure_instruments()
+        row = self._instruments_cache.get(symbol.upper())
+        return row["instrument_token"] if row else None
+
+    def get_balance(self) -> Optional[float]:
+        if not self._kite:
+            return None
+        try:
+            return float(self._kite.margins().get("equity", {}).get("available", {}).get("cash", 0))
+        except Exception as e:
+            log.error(f"Zerodha get_balance failed: {e}")
+            return None
+
+    def get_unified_balance(self) -> Optional[UnifiedBalance]:
+        if not self._kite:
+            return None
+        try:
+            eq = self._kite.margins().get("equity", {})
+            return UnifiedBalance(
+                broker=self.name, currency="INR",
+                cash=float(eq.get("available", {}).get("cash", 0)),
+                margin_used=float(eq.get("utilised", {}).get("debits", 0)),
+                margin_available=float(eq.get("net", 0)),
+            )
+        except Exception as e:
+            log.error(f"Zerodha get_unified_balance failed: {e}")
+            return None
+
+    def get_position(self, symbol: str) -> Optional[Dict]:
+        if not self._kite:
+            return None
+        try:
+            for p in self._kite.positions().get("net", []):
+                if p.get("tradingsymbol", "").upper() == symbol.upper():
+                    return {"quantity": p.get("quantity", 0), "avg_price": p.get("average_price", 0),
+                            "unrealized_pnl": p.get("pnl", 0)}
+            return None
+        except Exception as e:
+            log.error(f"Zerodha get_position failed: {e}")
+            return None
+
+    def get_last_price(self, product_id: int, symbol: str) -> Optional[float]:
+        if not self._kite:
+            return None
+        try:
+            row = self._instruments_cache.get(symbol.upper())
+            if not row:
+                return None
+            key = f"{row['exchange']}:{symbol.upper()}"
+            return float(self._kite.ltp([key]).get(key, {}).get("last_price", 0))
+        except Exception as e:
+            log.error(f"Zerodha get_last_price failed: {e}")
+            return None
+
+    def place_bracket_order(self, product_id: int, symbol: str, sl_price, tp_price,
+                             direction: str, qty: float):
+        if not self._kite:
+            return {"success": False, "error": "zerodha not configured"}
+        if not is_nse_market_open():
+            return {"success": False, "error": "nse_market_closed"}
+        try:
+            txn = self._kite.TRANSACTION_TYPE_BUY if direction.upper() == "LONG" else self._kite.TRANSACTION_TYPE_SELL
+            order_id = self._kite.place_order(
+                variety=self._kite.VARIETY_REGULAR, exchange=self._kite.EXCHANGE_NFO,
+                tradingsymbol=symbol, transaction_type=txn, quantity=int(qty),
+                order_type=self._kite.ORDER_TYPE_MARKET, product=self._kite.PRODUCT_MIS,
+            )
+            return {"success": True, "order_id": order_id,
+                     "note": "no native BO — SL/TP need a separate monitor loop (not yet built)"}
+        except Exception as e:
+            log.error(f"Zerodha place_bracket_order failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def place_exit_order(self, product_id: int, symbol: str, direction: str, qty: float):
+        if not self._kite:
+            return {"success": False, "error": "zerodha not configured"}
+        try:
+            txn = self._kite.TRANSACTION_TYPE_SELL if direction.upper() == "LONG" else self._kite.TRANSACTION_TYPE_BUY
+            order_id = self._kite.place_order(
+                variety=self._kite.VARIETY_REGULAR, exchange=self._kite.EXCHANGE_NFO,
+                tradingsymbol=symbol, transaction_type=txn, quantity=int(qty),
+                order_type=self._kite.ORDER_TYPE_MARKET, product=self._kite.PRODUCT_MIS,
+            )
+            return {"success": True, "order_id": order_id}
+        except Exception as e:
+            log.error(f"Zerodha place_exit_order failed: {e}")
+            return {"success": False, "error": str(e)}
+
+
+# Registers ONLY if real credentials exist in the environment — if
+# ZERODHA_API_KEY/ZERODHA_ACCESS_TOKEN are unset (the default), this adapter
+# never joins broker_manager, Delta stays the sole active broker, and
+# nothing about existing behavior changes.
+if ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN:
+    broker_manager.register(ZerodhaBroker(), make_active=False)
+    log.info("🟢 ZerodhaBroker registered (inactive) — switch via /control/<secret>/broker/switch/zerodha")
+
+
+# ---- Zerodha Daily Re-Auth (Roadmap Phase 2 completion) ----------------------
+# ⚠️ UNTESTED, BEST-EFFORT — Kite Connect has no official refresh-token flow,
+# so access_token expires ~7:30am IST every day and something has to redo
+# the login. The flow below (login → twofa → connect redirect →
+# generate_session) mirrors what a human does in the browser; it is a
+# widely-used community pattern for personal-account automation, not an
+# official Zerodha API, so it can silently break if Zerodha changes their
+# login page. Store ZERODHA_USER_ID / ZERODHA_PASSWORD / ZERODHA_TOTP_SECRET
+# only as platform secret env vars (Railway/Render) — never in code, logs,
+# or the dashboard. If this fails, it fails quietly (logs + returns None) —
+# it can never crash the process, and the previous day's token (or none)
+# stays in place until it succeeds.
+try:
+    import pyotp
+    _PYOTP_AVAILABLE = True
+except ImportError:
+    pyotp = None
+    _PYOTP_AVAILABLE = False
+
+ZERODHA_USER_ID = os.environ.get("ZERODHA_USER_ID", "")
+ZERODHA_PASSWORD = os.environ.get("ZERODHA_PASSWORD", "")
+ZERODHA_TOTP_SECRET = os.environ.get("ZERODHA_TOTP_SECRET", "")
+ZERODHA_REAUTH_HOUR_IST = int(os.environ.get("ZERODHA_REAUTH_HOUR_IST", "8"))
+
+
+def zerodha_daily_login() -> Optional[str]:
+    """Never raises. Returns a fresh access_token on success, None on any
+    failure (missing config, network error, Zerodha login page changed,
+    wrong TOTP, etc.) — callers must treat None as 'still not configured',
+    not as a fatal error."""
+    if not (_PYOTP_AVAILABLE and ZERODHA_USER_ID and ZERODHA_PASSWORD and ZERODHA_TOTP_SECRET
+            and ZERODHA_API_KEY and ZERODHA_API_SECRET and _KITECONNECT_AVAILABLE):
+        return None
+    try:
+        s = requests.Session()
+        r1 = s.post("https://kite.zerodha.com/api/login",
+                     data={"user_id": ZERODHA_USER_ID, "password": ZERODHA_PASSWORD}, timeout=10)
+        r1.raise_for_status()
+        request_id = r1.json()["data"]["request_id"]
+
+        totp = pyotp.TOTP(ZERODHA_TOTP_SECRET).now()
+        r2 = s.post("https://kite.zerodha.com/api/twofa",
+                     data={"user_id": ZERODHA_USER_ID, "request_id": request_id, "twofa_value": totp},
+                     timeout=10)
+        r2.raise_for_status()
+
+        r3 = s.get("https://kite.zerodha.com/connect/login",
+                    params={"api_key": ZERODHA_API_KEY, "v": "3"}, timeout=10, allow_redirects=True)
+        request_token = None
+        for resp_hist in list(r3.history) + [r3]:
+            if "request_token=" in resp_hist.url:
+                request_token = resp_hist.url.split("request_token=")[1].split("&")[0]
+                break
+        if not request_token:
+            log.error("Zerodha daily login: no request_token found in redirect chain "
+                      "(Zerodha may have changed their login flow)")
+            return None
+
+        kite = KiteConnect(api_key=ZERODHA_API_KEY)
+        session = kite.generate_session(request_token, api_secret=ZERODHA_API_SECRET)
+        log.info("🟢 Zerodha daily re-auth succeeded")
+        return session["access_token"]
+    except Exception as e:
+        log.error(f"Zerodha daily login failed: {e}")
+        return None
+
+
+def _zerodha_reauth_loop():
+    """Wakes hourly (not one long sleep) so a Railway/Render restart mid-day
+    doesn't miss the login window; re-authenticates once per calendar day.
+
+    Uses >= (not ==) on the hour check on purpose: if the process restarts
+    at, say, 11am and the target hour is 8am, `already_ran_today` is None on
+    a fresh start, so this fires immediately instead of waiting until 8am
+    tomorrow — a real gap in the first version of this loop (up to ~23h with
+    a stale/missing token) caught while re-reading this code just now."""
+    global ZERODHA_ACCESS_TOKEN
+    already_ran_today = None
+    while True:
+        try:
+            now_ist = datetime.now(timezone.utc).astimezone(IST)
+            today_key = now_ist.date().isoformat()
+            if now_ist.hour >= ZERODHA_REAUTH_HOUR_IST and already_ran_today != today_key:
+                token = zerodha_daily_login()
+                if token:
+                    ZERODHA_ACCESS_TOKEN = token
+                    existing = broker_manager._brokers.get("zerodha")
+                    if existing is not None and existing._kite is not None:
+                        existing._kite.set_access_token(token)
+                    elif existing is None:
+                        broker_manager.register(ZerodhaBroker(), make_active=False)
+                    already_ran_today = today_key
+        except Exception as e:
+            log.error(f"Zerodha reauth loop error: {e}\n{traceback.format_exc()}")
+        time.sleep(3600)
+
+
+# ---- Generic Manual SL/TP Monitor (Roadmap Phase 2 completion) ---------------
+# Delta's place_bracket_order() already enforces SL/TP natively via Delta's
+# own bracket-order API — this loop is NOT used for Delta and never touches
+# it. It exists for any broker whose place_bracket_order() can only place a
+# plain entry order (Zerodha today, since SEBI banned native BO in 2020) and
+# needs SL/TP enforced by watching price. Written against the BrokerAdapter
+# interface only, so any future broker in the same situation gets this for
+# free — nothing here is Zerodha-specific.
+_manual_sltp_lock = threading.Lock()
+_manual_sltp_watches: Dict[str, Dict] = {}   # key: "{broker}:{symbol}"
+
+
+def _ensure_manual_sltp_table():
+    """Additive table — CREATE TABLE IF NOT EXISTS only, same pattern as the
+    rest of init_db() above. Never touches any existing table."""
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_sltp_watches (
+                broker TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                sl_price REAL NOT NULL,
+                tp_price REAL NOT NULL,
+                qty REAL NOT NULL,
+                registered_at TEXT NOT NULL,
+                PRIMARY KEY (broker, symbol)
+            )
+        """)
+        conn.commit()
+
+
+def _load_manual_sltp_watches_from_db():
+    """Called once at boot, right after init_db() — repopulates the
+    in-memory dict so a bot restart (deploy, crash-recovery, systemd
+    restart) doesn't silently drop SL/TP protection on an already-open
+    position. Root-cause fix: without this, the in-memory-only version
+    built earlier this session would lose every pending watch on restart."""
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT * FROM manual_sltp_watches").fetchall()
+        with _manual_sltp_lock:
+            for r in rows:
+                r = dict(r)
+                _manual_sltp_watches[f"{r['broker']}:{r['symbol']}"] = r
+        if rows:
+            log.info(f"🎯 Restored {len(rows)} manual SL/TP watch(es) from DB after restart")
+    except Exception as e:
+        log.error(f"Failed to restore manual SL/TP watches from DB: {e}")
+
+
+def register_manual_sltp_watch(broker_name: str, symbol: str, direction: str,
+                                sl_price: float, tp_price: float, qty: float):
+    """Call right after a non-Delta broker's place_bracket_order() succeeds —
+    that call only places the entry; this is what actually enforces SL/TP.
+    Persisted to SQLite immediately, so this watch survives a restart."""
+    key = f"{broker_name}:{symbol}"
+    watch = {
+        "broker": broker_name, "symbol": symbol, "direction": direction.upper(),
+        "sl_price": float(sl_price), "tp_price": float(tp_price), "qty": float(qty),
+        "registered_at": datetime.utcnow().isoformat(),
+    }
+    with _manual_sltp_lock:
+        _manual_sltp_watches[key] = watch
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO manual_sltp_watches "
+                "(broker, symbol, direction, sl_price, tp_price, qty, registered_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (watch["broker"], watch["symbol"], watch["direction"], watch["sl_price"],
+                 watch["tp_price"], watch["qty"], watch["registered_at"]),
+            )
+            conn.commit()
+    except Exception as e:
+        log.error(f"Failed to persist manual SL/TP watch {key} to DB (in-memory watch still active): {e}")
+    log.info(f"🎯 Manual SL/TP watch registered: {key} SL={sl_price} TP={tp_price}")
+
+
+def unregister_manual_sltp_watch(broker_name: str, symbol: str):
+    key = f"{broker_name}:{symbol}"
+    with _manual_sltp_lock:
+        _manual_sltp_watches.pop(key, None)
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM manual_sltp_watches WHERE broker=? AND symbol=?",
+                         (broker_name, symbol))
+            conn.commit()
+    except Exception as e:
+        log.error(f"Failed to remove persisted manual SL/TP watch {key} from DB: {e}")
+
+
+def _manual_sltp_monitor_loop(interval_s: int = 5):
+    while True:
+        try:
+            with _manual_sltp_lock:
+                watches = list(_manual_sltp_watches.values())
+            for w in watches:
+                broker = broker_manager._brokers.get(w["broker"])
+                if not broker or not broker.is_configured():
+                    continue
+                price = broker.get_last_price(0, w["symbol"])
+                if price is None:
+                    continue
+                hit_sl = (w["direction"] == "LONG" and price <= w["sl_price"]) or \
+                         (w["direction"] == "SHORT" and price >= w["sl_price"])
+                hit_tp = (w["direction"] == "LONG" and price >= w["tp_price"]) or \
+                         (w["direction"] == "SHORT" and price <= w["tp_price"])
+                if hit_sl or hit_tp:
+                    reason = "SL" if hit_sl else "TP"
+                    result = broker.place_exit_order(0, w["symbol"], w["direction"], w["qty"])
+                    log.info(f"🚪 Manual {reason} hit: {w['broker']}:{w['symbol']} @ {price} — {result}")
+                    unregister_manual_sltp_watch(w["broker"], w["symbol"])
+                    notify_telegram(f"🚪 {w['broker'].upper()} {reason} hit on {w['symbol']} @ {price}")
+        except Exception as e:
+            log.error(f"Manual SL/TP monitor error: {e}\n{traceback.format_exc()}")
+        time.sleep(interval_s)
+
+
+@app.route("/broker/manual-sltp", methods=["GET"])
+@require_key
+def manual_sltp_view():
+    with _manual_sltp_lock:
+        return jsonify(list(_manual_sltp_watches.values()))
 
 
 # ---- Database Layer (thin, additive wrapper) ---------------------------------
@@ -7494,6 +8146,32 @@ def broker_health_view():
     return jsonify(snap)
 
 
+@app.route("/broker/balance", methods=["GET"])
+@require_key
+def broker_balance_view():
+    """Broker-agnostic balance — dashboard reads this one shape regardless
+    of which broker is active (Delta today, Zerodha/others later)."""
+    b = broker_manager.active()
+    if not b:
+        return jsonify({"error": "no active broker"}), 400
+    unified = b.get_unified_balance()
+    if unified is None:
+        return jsonify({"error": "balance unavailable", "broker": b.name}), 200
+    return jsonify(asdict(unified))
+
+
+@app.route("/broker/position/<symbol>", methods=["GET"])
+@require_key
+def broker_position_view(symbol):
+    """Broker-agnostic position lookup — same response shape no matter which
+    broker is active."""
+    b = broker_manager.active()
+    if not b:
+        return jsonify({"error": "no active broker"}), 400
+    unified = b.get_unified_position(symbol.upper())
+    return jsonify(asdict(unified))
+
+
 @app.route("/control/<secret>/broker/switch/<name>", methods=["GET"])
 def control_broker_switch(secret, name):
     if secret != CONTROL_PASSWORD:
@@ -7551,6 +8229,8 @@ Region: {REGION} | Base: {BASE_URL} | Live (env default): {LIVE_MODE_ENV_DEFAULT
 """)
     validate_config_or_die()
     init_db()
+    _ensure_manual_sltp_table()
+    _load_manual_sltp_watches_from_db()
 
     boot_paused = is_paused()  # informational log line only — every real check re-reads the DB
 
@@ -7589,6 +8269,14 @@ Region: {REGION} | Base: {BASE_URL} | Live (env default): {LIVE_MODE_ENV_DEFAULT
     threading.Thread(target=health_monitor.run_loop, daemon=True).start()
     log.info(f"🩺 HealthMonitor started (every {health_monitor.interval_s}s) — "
              f"broker_manager active='{broker_manager.status()['active']}'")
+
+    threading.Thread(target=_manual_sltp_monitor_loop, daemon=True).start()
+    log.info("🎯 Manual SL/TP monitor started (for brokers without native bracket orders)")
+
+    if ZERODHA_USER_ID and ZERODHA_TOTP_SECRET:
+        threading.Thread(target=_zerodha_reauth_loop, daemon=True).start()
+        log.info(f"🔁 Zerodha daily re-auth loop started (runs at {ZERODHA_REAUTH_HOUR_IST}:00 IST)")
+
     if AGGRESSIVE_EXITS_ENABLED:
         threading.Thread(target=_aggressive_exits_loop, daemon=True).start()
         log.info(f"🎯 Aggressive Exits monitor started (breakeven +{BREAKEVEN_TRIGGER_R}R, "
