@@ -349,6 +349,16 @@ def _background_time_sync_loop():
     """Re-checks drift every few minutes forever — catches a clock that jumps
     mid-session (container migration, host NTP correction, etc.) without
     needing a redeploy to fix a 401 storm."""
+    # [CRITICAL FIX] This used to sleep the full 5 minutes before its very
+    # first run. If the host's clock steps abruptly shortly after boot (e.g.
+    # chrony doing its first big correction, which is exactly what a freshly
+    # enabled chrony does on a clock that was previously drifted) the bot's
+    # cached drift goes stale immediately and nothing would re-correct it for
+    # however much of that 5 minutes was left — every signed request fails
+    # the whole time. Recheck soon after boot, when this is most likely, then
+    # fall back to the slower steady-state cadence.
+    time.sleep(60)
+    sync_time_with_delta(retries=1)
     while True:
         time.sleep(300)  # every 5 minutes
         sync_time_with_delta(retries=1)
@@ -3160,11 +3170,22 @@ def _self_check_tick():
     # 1) Plumbing health — reuses state the bot already tracks, no new I/O.
     drift = get_time_drift_ms()
     if abs(drift) >= SELF_CHECK_DRIFT_WARN_MS:
+        # [CRITICAL FIX] The log line below already claimed "Runs a fresh
+        # sync automatically" — but nothing here actually did that; the only
+        # real correction was the background loop's own 5-minute cycle. That
+        # meant a clock that had already drifted this far could sit
+        # uncorrected — every signed request failing — for up to 5 more
+        # minutes after this warning fired. Actually do what the message
+        # says: resync right now, then report what happened truthfully.
+        resynced = sync_time_with_delta(retries=1)
+        new_drift = get_time_drift_ms()
         log_self_report("warn", "clock_drift",
-                         f"Clock drift vs Delta's server is {drift:.0f}ms — approaching the "
-                         f"signature tolerance window.",
-                         detail="Runs a fresh sync automatically; if this keeps climbing the "
-                                "host machine's clock itself may need attention.")
+                         f"Clock drift vs Delta's server was {drift:.0f}ms — approaching the "
+                         f"signature tolerance window. "
+                         + (f"Resynced just now, now {new_drift:.0f}ms." if resynced
+                            else "Tried an immediate resync but that failed too — see logs above."),
+                         detail="If this keeps recurring, the host machine's clock itself may need "
+                                "chrony/ntp attention (`chronyc tracking` on the EC2 box).")
 
     if len(resolver.by_symbol) == 0:
         log_self_report("danger", "product_discovery",
