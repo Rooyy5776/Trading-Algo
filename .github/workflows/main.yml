@@ -20,7 +20,7 @@ jobs:
         username: ${{ secrets.USERNAME }}
         key: ${{ secrets.SSH_KEY }}
         source: "."
-        target: "/home/ubuntu/apex-bot"
+        target: "/home/ubuntu/Trading-Algo"
 
     - name: Install Dependencies
       uses: appleboy/ssh-action@v1.0.3
@@ -29,7 +29,8 @@ jobs:
         username: ${{ secrets.USERNAME }}
         key: ${{ secrets.SSH_KEY }}
         script: |
-          cd /home/ubuntu/apex-bot
+          cd /home/ubuntu/Trading-Algo
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip3 install --break-system-packages -r requirements.txt
+          sudo systemctl restart apex-nexus
