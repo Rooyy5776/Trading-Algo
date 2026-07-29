@@ -44,26 +44,6 @@ COMPANION FILES — kept separate on purpose, NOT merged into this file:
     deployment. The dashboard embedded below (Mission Control) still works
     standalone and needs none of this; the React app is an alternative, not
     a replacement of it.
-  • hybrid_sniper_engine.py — UNLIKE every companion above, this one IS
-    merged into this file (see "HYBRID SNIPER ENGINE" section below), not
-    kept separate. The original file was written as a standalone asyncio
-    prototype (async def, asyncio.create_task, its own event loop) — this
-    entire file is synchronous/threaded (Flask + threading.Thread loops,
-    plain `requests`, sqlite3) with zero asyncio anywhere else. Rather than
-    bolt a second, foreign concurrency model onto a live-trading process
-    (a real source of subtle bugs: a stray event loop in a background
-    thread, exceptions swallowed across the sync/async boundary, etc.), the
-    engine's actual logic — GlobalMarketScout's momentum check, Kotegawa's
-    panic-dip detection, the conviction-score/dynamic-risk formulas — was
-    ported line-for-line into plain synchronous functions/classes that run
-    as one more `threading.Thread` loop, identical in shape to every other
-    background loop in this file (_ai_oracle_loop, _self_check_loop, etc.).
-    It is also wired through every existing safety gate (kill-switch,
-    pause, circuit breaker, is_dry_run/is_live_mode, claim_symbol_for_entry
-    dedup) exactly like the Pine-driven webhook path — the standalone
-    prototype had no way to know about any of those, since they don't exist
-    outside this file. OFF by default (SNIPER_ENABLED=false) so merging it
-    in can never silently change existing behavior.
 ════════════════════════════════════════════════════════════════════════════════
 THE ONE PROBLEM THIS VERSION SOLVES FOREVER:
   You used to have to manually look up and hardcode a Delta Exchange
@@ -85,11 +65,6 @@ PREMIUM ENGINES INCLUDED:
   • Native Bracket Orders — Delta attaches SL + TP automatically at entry
     and cancels whichever one didn't fill, on its own (verified against
     Delta's official /v2/orders/bracket API — see comments below)
-  • [NEW] Hybrid Sniper Engine — independent panic-dip mean-reversion
-    strategy (Kotegawa-style: sharp drop + volume spike, vetoed by a
-    broader-market momentum filter), fully gated behind the same
-    kill-switch/pause/circuit-breaker/dry-run controls as everything else.
-    OFF by default — see SNIPER_ENABLED below.
   • Full control endpoints (pause / resume / close-all / reset-circuit-breaker)
   • [PREMIUM NEW] Circuit Breaker — daily loss limit (R-multiples) + max
     consecutive losses, DB-backed so it works correctly under multiple
@@ -125,6 +100,7 @@ import math
 import hashlib
 import logging
 import sqlite3
+import contextlib
 import threading
 import traceback
 import statistics
@@ -136,6 +112,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
+from abc import ABC, abstractmethod
 
 import requests
 from flask import Flask, request, jsonify
@@ -149,33 +126,6 @@ try:
     import psutil  # package: psutil — only needed for the System Health panel
 except ImportError:
     psutil = None
-
-# ════════════════════════════════════════════════════════════════════════════════
-# [CRITICAL FIX — .env WAS NEVER ACTUALLY LOADED] Every secret below (DELTA_API_KEY,
-# DELTA_API_SECRET, APEX_WEBHOOK_PASSPHRASE, etc.) is read via os.environ.get(...).
-# That only sees variables the ENCLOSING PROCESS already has — it does NOT read a
-# .env file sitting next to this script. On Railway/Render the platform itself
-# injects env vars straight into the process, so a .env file was never needed and
-# this gap stayed invisible. On a plain AWS EC2 box there is no such platform
-# injection: editing .env and re-running `python3 main.py` silently changed
-# nothing, because nothing ever read the file — the process just kept using
-# whatever was last `export`ed in that shell session (or nothing at all). THAT is
-# the actual reason repeated .env edits looked like they had zero effect. Fix:
-# explicitly load .env from the same directory as this script (works no matter
-# which folder you launch from), before any os.environ.get(...) call below.
-# Fails soft (one clear log line, never raises) if python-dotenv isn't installed
-# — so this can only help, never break, a Railway/Render deploy.
-# ════════════════════════════════════════════════════════════════════════════════
-from pathlib import Path
-try:
-    from dotenv import load_dotenv
-    _ENV_PATH = Path(__file__).resolve().parent / ".env"
-    if load_dotenv(dotenv_path=_ENV_PATH):
-        print(f"[env] loaded {_ENV_PATH}")
-    else:
-        print(f"[env] no .env file found at {_ENV_PATH} — relying on already-exported shell environment variables")
-except ImportError:
-    print("[env] python-dotenv not installed (pip install python-dotenv) — relying on already-exported shell environment variables only")
 
 _PROCESS_START_TIME = time.time()
 
@@ -1010,25 +960,11 @@ class BinanceLiquidationFeed:
         streams = "/".join(f"{s.lower()}@forceOrder" for s in self.symbols)
         url = f"wss://fstream.binance.com/ws/stream?streams={streams}"
         while True:
-            ws = None
             try:
                 ws = websocket.WebSocketApp(url, on_message=self._on_message)
-                # ping_interval/ping_timeout keep the socket from going stale
-                # silently; run_forever() blocks here until disconnect.
-                ws.run_forever(ping_interval=30, ping_timeout=10)
+                ws.run_forever()
             except Exception as e:
                 log.warning(f"Liquidation feed error: {e}")
-            finally:
-                # [FD-LEAK GUARD] Belt-and-suspenders: explicitly close the
-                # underlying socket every time this loop exits, instead of
-                # trusting run_forever() to always clean up on every code
-                # path. Cheap insurance against the same class of "Too many
-                # open files" crash the db() leak caused.
-                try:
-                    if ws is not None:
-                        ws.close()
-                except Exception:
-                    pass
             time.sleep(5)
 
     def _on_message(self, ws, message):
@@ -1551,52 +1487,7 @@ def _ai_oracle_loop():
 # an existing table if it's missing. Adding a new field in the future means
 # adding ONE line here — never a manual migration, never a wiped database.
 # ════════════════════════════════════════════════════════════════════════════════
-# ────────────────────────────────────────────────────────────────────────────────
-# ★★★ CRITICAL FIX — CONNECTION LEAK BEHIND "Too many open files" ★★★
-# ROOT CAUSE: every one of the ~26 call sites in this file does
-# `with db() as conn:`. That looks safe, but sqlite3.Connection's OWN
-# __enter__/__exit__ only commits (success) or rolls back (exception) the
-# open transaction — it does NOT call conn.close(). So every single
-# `with db() as conn:` in this file was opening a new connection and never
-# closing it. Each open SQLite connection holds onto several file
-# descriptors (main db file + WAL file + shm file). Over enough uptime —
-# with positions/trades/self-checks/oracle predictions all hitting the DB
-# every few seconds to minutes — this silently climbs until the process
-# hits its file-descriptor limit, at which point EVERYTHING that needs a
-# new fd (new DB connections, new outbound HTTPS sockets for signed Delta
-# calls, even Python's own module imports) starts failing with
-# `OSError: [Errno 24] Too many open files` / "unable to open database
-# file". This is also why the clock-drift correction can look like it
-# "stops working" after a while — once sockets can't open, the periodic
-# resync against Delta's server clock silently fails too.
-# THE FIX: `db()` now returns a real auto-closing wrapper. Every existing
-# `with db() as conn:` call site keeps working exactly as before — same
-# commit-on-success / rollback-on-exception behavior — but conn.close()
-# is now guaranteed to run every time, so connections stop piling up.
-# ────────────────────────────────────────────────────────────────────────────────
-class _AutoClosingConnection:
-    """Wraps a sqlite3.Connection so `with db() as conn:` commits/rolls back
-    AND closes the connection afterward — sqlite3.Connection's built-in
-    context manager does the former but never the latter."""
-    __slots__ = ("_conn",)
-
-    def __init__(self, conn):
-        self._conn = conn
-
-    def __enter__(self):
-        return self._conn
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if exc_type is None:
-                self._conn.commit()
-            else:
-                self._conn.rollback()
-        finally:
-            self._conn.close()
-        return False  # never swallow the original exception
-
-
+@contextlib.contextmanager
 def db():
     # timeout=10: if the DB is briefly locked by another connection, wait up
     # to 10s and retry instead of failing immediately with "database is locked".
@@ -1607,7 +1498,29 @@ def db():
     # more than one request in flight at once (e.g. gunicorn -w > 1).
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
-    return _AutoClosingConnection(conn)
+    # [CRITICAL FIX — FD LEAK / crash after running a while] sqlite3.Connection
+    # implements __enter__/__exit__ itself, but that built-in context manager
+    # only commits (on success) or rolls back (on exception) — it does NOT
+    # close the connection. Every "with db() as conn:" in this file was
+    # trusting `with` to close it the way it closes a file; it never did.
+    # Each call leaked one connection (plus WAL's extra -wal/-shm file
+    # handles) for the rest of the process's life. Enough of those over
+    # enough hours/days and the process hits its open-file-descriptor limit:
+    # "OSError: [Errno 24] Too many open files" /
+    # "sqlite3.OperationalError: unable to open database file" — which is
+    # unrecoverable without a restart. Making this a real @contextmanager
+    # with try/finally: conn.close() fixes all 31 call sites at once — every
+    # "with db() as conn:" elsewhere in the file is unchanged and keeps its
+    # existing commit-on-success / rollback-on-exception behavior, it just
+    # now actually closes too.
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _ensure_column(conn, table: str, column: str, coltype: str):
@@ -2012,6 +1925,19 @@ def notify_telegram(text: str):
 # DELTA API — SIGNED REQUESTS
 # ════════════════════════════════════════════════════════════════════════════════
 def _signed_request(method: str, path: str, payload_dict: Dict = None) -> Optional[Dict]:
+    # [CRITICAL FIX — REGRESSION] Without this, the "use Delta's own
+    # authoritative server_time from the error body" correction further
+    # below (`_time_drift_ms = ...`) silently creates a LOCAL variable
+    # instead of updating the module-level drift used by every future
+    # signed request — Python decides a name is local to a function at
+    # compile time if it's assigned anywhere in that function, unless it's
+    # declared global first. That's exactly why the corrected value never
+    # stuck: every request kept re-signing with the old, wrong drift and
+    # kept failing with expired_signature no matter how many times this
+    # "fix" ran. Same bug class as the one already fixed in
+    # sync_time_with_delta() — but that fix lives in a different function's
+    # scope, so it didn't cover this one.
+    global _time_drift_ms
     if not API_KEY or not API_SECRET:
         raise ValueError("DELTA_API_KEY / DELTA_API_SECRET not set")
 
@@ -2653,6 +2579,244 @@ def get_last_traded_price(product_id: int, symbol: str) -> Optional[float]:
         return None
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# REAL HISTORICAL CANDLES — Delta's public /v2/history/candles (no signing
+# needed, it's public market data). This was previously MISSING entirely even
+# though the dashboard's own JS comment claimed "Real candles — proxied
+# through main.py's /candles" — that route never existed, so the chart
+# silently fell back to fake random-walk candles on every single load, live
+# or not. Also reused below by the historical backtest engine, which needs
+# the same data in bulk rather than a display-sized window.
+# ════════════════════════════════════════════════════════════════════════════
+VALID_RESOLUTIONS = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","1d","7d","30d","1w","2w"}
+_RES_SECONDS = {"1m":60,"3m":180,"5m":300,"15m":900,"30m":1800,"1h":3600,"2h":7200,
+                "4h":14400,"6h":21600,"1d":86400,"7d":604800,"30d":2592000,"1w":604800,"2w":1209600}
+
+def fetch_delta_candles(symbol: str, resolution: str, start_ts: int, end_ts: int) -> List[Dict]:
+    """Real historical OHLCV from Delta's public candles endpoint. Raises on
+    failure rather than swallowing errors — callers decide how to degrade."""
+    if resolution not in VALID_RESOLUTIONS:
+        raise ValueError(f"unsupported resolution {resolution!r}, must be one of {sorted(VALID_RESOLUTIONS)}")
+    resp = delta_http.get(f"{BASE_URL}/v2/history/candles", params={
+        "symbol": symbol, "resolution": resolution, "start": start_ts, "end": end_ts,
+    }, timeout=10)
+    resp.raise_for_status()
+    body = resp.json()
+    rows = body.get("result", []) or []
+    # Delta returns newest-first; normalize to oldest-first for both the chart
+    # and the backtest simulator, which both need to walk forward in time.
+    rows = sorted(rows, key=lambda r: r.get("time", 0))
+    return [{"time": r.get("time"), "open": safe_float(r.get("open")), "high": safe_float(r.get("high")),
+              "low": safe_float(r.get("low")), "close": safe_float(r.get("close")),
+              "volume": safe_float(r.get("volume"))} for r in rows]
+
+
+@app.route("/candles", methods=["GET"])
+@require_key
+def candles():
+    symbol = request.args.get("symbol", "BTCUSD").strip().upper()
+    resolution = request.args.get("resolution", "15m").strip().lower()
+    limit = request.args.get("limit", 60, type=int)
+    limit = max(1, min(limit, 1000))
+    if resolution not in VALID_RESOLUTIONS:
+        return jsonify({"error": f"unsupported resolution, use one of {sorted(VALID_RESOLUTIONS)}"}), 400
+    end_ts = int(time.time())
+    start_ts = end_ts - limit * _RES_SECONDS[resolution]
+    try:
+        rows = fetch_delta_candles(symbol, resolution, start_ts, end_ts)
+        return jsonify({"candles": rows[-limit:], "symbol": symbol, "resolution": resolution})
+    except Exception as e:
+        log.warning(f"/candles fetch failed for {symbol}@{resolution}: {e}")
+        return jsonify({"error": "could not fetch candles from Delta", "detail": str(e)}), 502
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HISTORICAL BACKTEST ENGINE — real OHLCV replay, honestly scoped.
+# ────────────────────────────────────────────────────────────────────────────
+# IMPORTANT — READ BEFORE TRUSTING THESE NUMBERS:
+# This does NOT replicate APEX NEXUS's actual Pine Script (9 signal tiers,
+# VSA Fakeout Shield, KNN/LR/MLP ensemble, Wyckoff/ICT structure, CVD, the
+# ADX-tied ML weighting, etc). Porting 4,000+ lines of Pine logic 1:1 to
+# Python — and proving it produces bar-for-bar identical signals — is a
+# separate, much larger project than what's built here.
+# What THIS is: a real engine that pulls genuine historical OHLCV from Delta
+# and replays a much simpler EMA-trend + RSI + ADX-filter strategy against
+# it bar-by-bar, with realistic fees and slippage subtracted from every
+# trade. It answers "does a basic trend/momentum approach have any edge on
+# this symbol's real history at all" — a sanity floor, not a verdict on your
+# actual strategy. Treat a good result here as "worth building the real
+# port"; treat a bad result as a signal to look harder before going live —
+# either way, it is not a substitute for backtesting the real signal logic.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _ema_series(values: List[float], period: int) -> List[Optional[float]]:
+    if len(values) < period: return [None]*len(values)
+    k = 2/(period+1)
+    out = [None]*(period-1)
+    seed = sum(values[:period])/period
+    out.append(seed)
+    prev = seed
+    for v in values[period:]:
+        prev = v*k + prev*(1-k)
+        out.append(prev)
+    return out
+
+def _rsi_series(closes: List[float], period: int = 14) -> List[Optional[float]]:
+    n = len(closes)
+    out = [None]*n
+    if n <= period: return out
+    gains = losses = 0.0
+    for i in range(1, period+1):
+        d = closes[i]-closes[i-1]
+        gains += max(d,0); losses += max(-d,0)
+    avg_gain, avg_loss = gains/period, losses/period
+    out[period] = 100.0 if avg_loss==0 else 100 - 100/(1+avg_gain/avg_loss)
+    for i in range(period+1, n):
+        d = closes[i]-closes[i-1]
+        avg_gain = (avg_gain*(period-1) + max(d,0))/period
+        avg_loss = (avg_loss*(period-1) + max(-d,0))/period
+        out[i] = 100.0 if avg_loss==0 else 100 - 100/(1+avg_gain/avg_loss)
+    return out
+
+def _atr_adx_series(highs, lows, closes, period: int = 14):
+    n = len(closes)
+    tr = [0.0]*n; plus_dm=[0.0]*n; minus_dm=[0.0]*n
+    for i in range(1,n):
+        tr[i] = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        up, down = highs[i]-highs[i-1], lows[i-1]-lows[i]
+        plus_dm[i] = up if (up>down and up>0) else 0.0
+        minus_dm[i] = down if (down>up and down>0) else 0.0
+    atr=[None]*n; pdi=[None]*n; mdi=[None]*n; adx=[None]*n
+    if n <= period*2: return atr, adx
+    atr_v = sum(tr[1:period+1])/period
+    pdm_v = sum(plus_dm[1:period+1])/period
+    mdm_v = sum(minus_dm[1:period+1])/period
+    dx_hist = []
+    for i in range(period+1, n):
+        atr_v = (atr_v*(period-1)+tr[i])/period
+        pdm_v = (pdm_v*(period-1)+plus_dm[i])/period
+        mdm_v = (mdm_v*(period-1)+minus_dm[i])/period
+        atr[i] = atr_v
+        pdi_v = 100*pdm_v/atr_v if atr_v>0 else 0
+        mdi_v = 100*mdm_v/atr_v if atr_v>0 else 0
+        dx = 100*abs(pdi_v-mdi_v)/(pdi_v+mdi_v) if (pdi_v+mdi_v)>0 else 0
+        dx_hist.append(dx)
+        if len(dx_hist) >= period:
+            adx[i] = sum(dx_hist[-period:])/period
+    return atr, adx
+
+def simulate_simple_strategy(candles: List[Dict], adx_threshold: float = 20.0,
+                              sl_atr_mult: float = 1.5, tp_atr_mult: float = 2.5,
+                              fee_pct: float = 0.05, slippage_pct: float = 0.03) -> List[Dict]:
+    """Bar-by-bar replay of the simplified proxy strategy described above.
+    fee_pct/slippage_pct are ROUND-TRIP percentages applied against notional
+    on both entry and exit — deliberately pessimistic (real Delta taker fees
+    are typically lower) so this errs toward under- rather than over-stating
+    edge. Returns a list of completed trade dicts with real entry/exit prices
+    and realized pnl already net of costs."""
+    closes = [c["close"] for c in candles]; highs=[c["high"] for c in candles]; lows=[c["low"] for c in candles]
+    ema_fast = _ema_series(closes, 9); ema_slow = _ema_series(closes, 21)
+    rsi = _rsi_series(closes, 14)
+    atr, adx = _atr_adx_series(highs, lows, closes, 14)
+    trades = []
+    pos = None  # {direction, entry_price, entry_i, sl, tp}
+    cost_mult = (fee_pct + slippage_pct) / 100.0
+    for i in range(1, len(candles)):
+        if None in (ema_fast[i], ema_slow[i], ema_fast[i-1], ema_slow[i-1], rsi[i], adx[i], atr[i]):
+            continue
+        price = closes[i]
+        if pos:
+            hit_sl = price <= pos["sl"] if pos["direction"]=="BUY" else price >= pos["sl"]
+            hit_tp = price >= pos["tp"] if pos["direction"]=="BUY" else price <= pos["tp"]
+            if hit_sl or hit_tp:
+                exit_price = pos["sl"] if hit_sl else pos["tp"]
+                dirmult = 1 if pos["direction"]=="BUY" else -1
+                gross = dirmult*(exit_price - pos["entry_price"])
+                cost = (pos["entry_price"] + exit_price) * cost_mult
+                trades.append({"direction":pos["direction"], "entry_price":pos["entry_price"], "exit_price":exit_price,
+                                "entry_time":pos["entry_time"], "exit_time":candles[i]["time"],
+                                "pnl_pct": ((gross-cost)/pos["entry_price"])*100, "exit_reason":"TP" if hit_tp else "SL"})
+                pos = None
+        if not pos:
+            bull_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
+            bear_cross = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
+            if adx[i] >= adx_threshold and bull_cross and rsi[i] > 50:
+                pos = {"direction":"BUY","entry_price":price,"entry_time":candles[i]["time"],
+                       "sl":price - atr[i]*sl_atr_mult, "tp":price + atr[i]*tp_atr_mult}
+            elif adx[i] >= adx_threshold and bear_cross and rsi[i] < 50:
+                pos = {"direction":"SELL","entry_price":price,"entry_time":candles[i]["time"],
+                       "sl":price + atr[i]*sl_atr_mult, "tp":price - atr[i]*tp_atr_mult}
+    return trades
+
+def summarize_backtest_trades(trades: List[Dict]) -> Optional[Dict]:
+    if not trades: return None
+    wins = [t for t in trades if t["pnl_pct"]>0]; losses=[t for t in trades if t["pnl_pct"]<=0]
+    gross_profit = sum(t["pnl_pct"] for t in wins); gross_loss = abs(sum(t["pnl_pct"] for t in losses))
+    running=0.0; peak=0.0; max_dd=0.0; curve=[]
+    returns = [t["pnl_pct"] for t in trades]
+    for r in returns:
+        running += r; peak = max(peak, running); max_dd = max(max_dd, peak-running); curve.append(running)
+    mean_r = running/len(trades)
+    variance = sum((r-mean_r)**2 for r in returns)/len(trades) if len(trades)>1 else 0
+    stdev = variance**0.5
+    return {
+        "total_trades": len(trades), "wins": len(wins), "losses": len(losses),
+        "win_rate": (len(wins)/len(trades))*100,
+        "profit_factor": (gross_profit/gross_loss) if gross_loss>0 else (float('inf') if gross_profit>0 else 0),
+        "net_return_pct": running, "expectancy_pct": mean_r, "max_drawdown_pct": max_dd,
+        "sharpe_like": (mean_r/stdev) if stdev>0 else None,
+        "equity_curve_pct": curve,
+    }
+
+@app.route("/backtest/run", methods=["GET"])
+@require_key
+def backtest_run():
+    symbol = request.args.get("symbol", "BTCUSD").strip().upper()
+    resolution = request.args.get("resolution", "1h").strip().lower()
+    days = request.args.get("days", 60, type=int)
+    adx_threshold = request.args.get("adx_threshold", 20.0, type=float)
+    if resolution not in VALID_RESOLUTIONS:
+        return jsonify({"error": f"unsupported resolution, use one of {sorted(VALID_RESOLUTIONS)}"}), 400
+    max_candles = 5000  # keep single-request payload/runtime sane
+    days = max(3, min(days, (max_candles * _RES_SECONDS[resolution]) // 86400 or 3))
+    end_ts = int(time.time()); start_ts = end_ts - days*86400
+    try:
+        rows = fetch_delta_candles(symbol, resolution, start_ts, end_ts)
+    except Exception as e:
+        log.warning(f"/backtest/run candle fetch failed for {symbol}@{resolution}: {e}")
+        return jsonify({"error": "could not fetch historical candles from Delta", "detail": str(e)}), 502
+    if len(rows) < 60:
+        return jsonify({"error": "not enough historical candles returned to backtest (need 60+)", "candles_received": len(rows)}), 422
+
+    all_trades = simulate_simple_strategy(rows, adx_threshold=adx_threshold)
+    full_stats = summarize_backtest_trades(all_trades)
+
+    # [BONUS] Walk-forward split — first 70% of history (in-sample) vs the
+    # most recent 30% (out-of-sample). If in-sample looks great but
+    # out-of-sample doesn't, that's a classic overfitting/regime-shift red
+    # flag worth knowing about BEFORE trusting the headline numbers.
+    split_i = int(len(rows)*0.7)
+    in_sample_trades = simulate_simple_strategy(rows[:split_i], adx_threshold=adx_threshold)
+    out_sample_trades = simulate_simple_strategy(rows[split_i:], adx_threshold=adx_threshold)
+
+    return jsonify({
+        "symbol": symbol, "resolution": resolution, "days": days,
+        "candles_used": len(rows),
+        "range": {"start": rows[0]["time"], "end": rows[-1]["time"]},
+        "params": {"adx_threshold": adx_threshold, "sl_atr_mult": 1.5, "tp_atr_mult": 2.5,
+                    "fee_pct_roundtrip": 0.05, "slippage_pct_roundtrip": 0.03},
+        "full_period": full_stats,
+        "walk_forward": {
+            "in_sample": summarize_backtest_trades(in_sample_trades),
+            "out_of_sample": summarize_backtest_trades(out_sample_trades),
+        },
+        "methodology_note": ("Simplified EMA(9/21) + RSI(14) + ADX(14) trend/momentum proxy strategy on REAL Delta "
+                              "historical OHLCV, fixed ATR-multiple SL/TP, realistic round-trip fees+slippage deducted. "
+                              "This is NOT a replica of your Pine Script's full signal system — see code comments above "
+                              "backtest_run() for the full disclosure."),
+    })
+
+
 def _aggressive_exits_tick():
     with db() as conn:
         open_positions = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
@@ -3193,423 +3357,6 @@ neural_syndicate = NeuralSyndicate()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# ★★★ HYBRID SNIPER ENGINE (merged in-process from hybrid_sniper_engine.py) ★★★
-# ────────────────────────────────────────────────────────────────────────────────
-# Ported synchronous, from the standalone asyncio prototype — see the file
-# header's COMPANION FILES note for why. Same math throughout (conviction
-# score, dynamic risk, panic-dip thresholds), same intent (long-only
-# mean-reversion on a sharp panic drop + volume spike, vetoed if the broader
-# market is trending hard against it) — different execution model and now
-# wired to every safety gate the rest of this bot already has.
-#
-# WIRING SUMMARY (what "no gaps" means concretely):
-#   • Entry goes through claim_symbol_for_entry() — the SAME atomic dedup
-#     lock the Pine webhook path uses, on the SAME positions table. A
-#     symbol the sniper is in can never also be double-entered by Pine
-#     (or vice versa), and a symbol Pine already holds can never be
-#     double-entered by the sniper.
-#   • Checked before every attempt, same as the webhook ENTRY path:
-#     API_CREDENTIALS_OK, is_kill_switch_active(), is_paused(),
-#     circuit_breaker_tripped().
-#   • Order placement goes through the EXISTING place_entry_order() /
-#     place_bracket_order() — meaning is_dry_run()/is_live_mode() are
-#     respected automatically; a DRY RUN toggle on the dashboard controls
-#     this engine exactly like it controls Pine-driven trades, with zero
-#     extra code.
-#   • Positions are written with upsert_position()/log_trade() — sniper
-#     trades show up in /positions, /trades, and the dashboard exactly
-#     like Pine trades, tagged signal="HYBRID_SNIPER" so they're
-#     distinguishable.
-#   • THE ONE REAL GAP THAT NEEDED NEW CODE (not just wiring): Pine-driven
-#     positions get marked closed because Pine itself sends a TRADE_CLOSE
-#     webhook when its own SL/TP fires. Nothing plays that role for a
-#     sniper-opened position — if its native Delta bracket fires, this bot
-#     would otherwise never find out, and that position would sit in the
-#     DB as "open" forever (dead position on the dashboard, and the
-#     circuit breaker / this engine's own loss-streak guard never learning
-#     the trade finished). _sniper_reconcile_closed_positions() below
-#     closes that gap by periodically checking Delta's own live position
-#     size for every HYBRID_SNIPER row this bot still thinks is open.
-#
-# OFF BY DEFAULT: SNIPER_ENABLED=false. The loop thread always starts (so a
-# dashboard/control toggle can turn it on without a redeploy — same
-# DB-backed-override pattern as risk_sizing_enabled() above), but does
-# nothing at all until enabled.
-# ════════════════════════════════════════════════════════════════════════════════
-SNIPER_ENABLED = os.environ.get("SNIPER_ENABLED", "false").strip().lower() == "true"
-SNIPER_SYMBOL = os.environ.get("SNIPER_SYMBOL", "BTC").strip().upper()
-SNIPER_RESOLUTION = os.environ.get("SNIPER_RESOLUTION", "5m").strip()
-SNIPER_LOOKBACK = int(os.environ.get("SNIPER_LOOKBACK", "30"))
-SNIPER_INTERVAL_S = int(os.environ.get("SNIPER_INTERVAL_S", "60"))
-SNIPER_MAX_RISK_FRACTION = float(os.environ.get("SNIPER_MAX_RISK_FRACTION", "0.04"))
-SNIPER_STOP_LOSS_PCT = float(os.environ.get("SNIPER_STOP_LOSS_PCT", "0.008"))
-SNIPER_TAKE_PROFIT_RR = float(os.environ.get("SNIPER_TAKE_PROFIT_RR", "2.0"))
-SNIPER_DROP_THRESHOLD = float(os.environ.get("SNIPER_DROP_THRESHOLD", "-0.015"))
-SNIPER_VOLUME_MULTIPLIER = float(os.environ.get("SNIPER_VOLUME_MULTIPLIER", "2.0"))
-SNIPER_MAX_LOSS_STREAK = int(os.environ.get("SNIPER_MAX_LOSS_STREAK", "3"))
-# Broader-market veto — deliberately a DIFFERENT exchange/feed (Binance,
-# public, no keys) than the symbol actually being traded (Delta), same as
-# the original GlobalMarketScout design: a cheap, independent second
-# opinion on trend direction so a panic-dip long can't fire straight
-# against a genuine market-wide crash.
-SNIPER_GLOBAL_SYMBOL = os.environ.get("SNIPER_GLOBAL_SYMBOL", "BTCUSDT").strip().upper()
-SNIPER_GLOBAL_INTERVAL = os.environ.get("SNIPER_GLOBAL_INTERVAL", "5m").strip()
-SNIPER_GLOBAL_LOOKBACK = int(os.environ.get("SNIPER_GLOBAL_LOOKBACK", "20"))
-SNIPER_GLOBAL_MOMENTUM_THRESHOLD = float(os.environ.get("SNIPER_GLOBAL_MOMENTUM_THRESHOLD", "0.003"))
-
-
-def sniper_enabled() -> bool:
-    """DB-backed override, identical pattern to risk_sizing_enabled() above —
-    switchable at runtime (dashboard/control endpoint) without a redeploy.
-    Falls back to the SNIPER_ENABLED env var until explicitly set once."""
-    v = get_control_flag("sniper_enabled")
-    return SNIPER_ENABLED if v is None else (v == "true")
-
-
-def set_sniper_enabled(enabled: bool) -> None:
-    set_control_flag("sniper_enabled", "true" if enabled else "false")
-
-
-_SNIPER_RESOLUTION_SECONDS = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "1d": 86400,
-    "1w": 604800, "2w": 1209600, "7d": 604800, "30d": 2592000,
-}
-
-
-def fetch_recent_candles(symbol: str, resolution: str = "5m", lookback: int = 30) -> Optional[Dict]:
-    """
-    Pulls recent OHLCV candles from Delta's own public /v2/history/candles
-    endpoint — no auth needed, same reasoning as sync_time_with_delta()
-    above, so this works even while API credentials are invalid. Returns
-    plain Python lists (oldest-first), never numpy: this file deliberately
-    stays numpy-free elsewhere (RegimeDetector uses `statistics.mean`), and
-    a new dependency that can fail to install on a fresh box isn't worth it
-    for what's just a mean and a min(). Returns None (never raises) on any
-    failure — callers must treat that as "skip this cycle", never as zero.
-    Also backs the dashboard's /candles endpoint (see below) — the exact
-    same real data, one fetch function, two callers.
-    """
-    try:
-        product_id = resolver.resolve(symbol)
-        delta_symbol = (resolver.get_symbol_for(product_id) if product_id else None) or symbol.upper()
-        step_s = _SNIPER_RESOLUTION_SECONDS.get(resolution, 300)
-        end_ts = int(time.time())
-        start_ts = end_ts - step_s * (lookback + 2)  # a couple extra candles of buffer
-        resp = delta_http.get(f"{BASE_URL}/v2/history/candles", params={
-            "resolution": resolution, "symbol": delta_symbol, "start": start_ts, "end": end_ts,
-        }, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        rows = resp.json().get("result", [])
-        if not rows:
-            return None
-        rows = sorted(rows, key=lambda r: r.get("time", 0))[-lookback:]  # guarantee oldest-first
-        opens = [safe_float(r.get("open")) for r in rows]
-        highs = [safe_float(r.get("high")) for r in rows]
-        lows = [safe_float(r.get("low")) for r in rows]
-        closes = [safe_float(r.get("close")) for r in rows]
-        volumes = [safe_float(r.get("volume")) for r in rows]
-        times = [r.get("time") for r in rows]
-        if any(v is None for v in closes) or any(v is None for v in lows) or any(v is None for v in volumes):
-            return None
-        return {"symbol": delta_symbol, "product_id": product_id, "times": times,
-                "opens": opens, "highs": highs, "lows": lows, "closes": closes, "volumes": volumes}
-    except Exception as e:
-        log.debug(f"[Sniper] candle fetch failed for {symbol}/{resolution}: {e}")
-        return None
-
-
-def _sniper_check_global_momentum() -> int:
-    """Read-only Binance public klines check — no trading, no keys. Returns
-    1 (bullish), -1 (bearish), or 0 (neutral/unknown, e.g. Binance
-    unreachable — deliberately never vetoes on 0, same as the original
-    GlobalMarketScout.verify_global_alignment())."""
-    try:
-        resp = requests.get("https://api.binance.com/api/v3/klines", params={
-            "symbol": SNIPER_GLOBAL_SYMBOL, "interval": SNIPER_GLOBAL_INTERVAL, "limit": SNIPER_GLOBAL_LOOKBACK,
-        }, timeout=5)
-        resp.raise_for_status()
-        klines = resp.json()
-        if not isinstance(klines, list) or len(klines) < 2:
-            return 0
-        first_close, last_close = safe_float(klines[0][4]), safe_float(klines[-1][4])
-        if not first_close:
-            return 0
-        roc = (last_close - first_close) / first_close
-        if roc > SNIPER_GLOBAL_MOMENTUM_THRESHOLD:
-            return 1
-        if roc < -SNIPER_GLOBAL_MOMENTUM_THRESHOLD:
-            return -1
-        return 0
-    except Exception as e:
-        log.debug(f"[Sniper] global momentum check failed: {e}")
-        return 0
-
-
-@dataclass
-class SniperPanicScanResult:
-    is_panic: bool
-    price_drop_pct: float = 0.0
-    volume_ratio: float = 0.0
-
-
-def _sniper_scan_for_panic_dip(closes: List[float], volumes: List[float]) -> SniperPanicScanResult:
-    """Ported from KotegawaPanicEngine.scan_for_panic_dip — sudden panic-selling
-    overreaction: sharp single-candle drop plus a volume spike vs recent average."""
-    if len(closes) < 11 or len(volumes) < 11 or not closes[-2]:
-        return SniperPanicScanResult(False)
-    price_drop_pct = (closes[-1] - closes[-2]) / closes[-2]
-    recent_volumes = [v for v in volumes[-11:-1] if v is not None]  # current candle excluded
-    avg_volume = statistics.mean(recent_volumes) if recent_volumes else 0.0
-    current_volume = volumes[-1] or 0.0
-    volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 0.0
-    is_panic = price_drop_pct < SNIPER_DROP_THRESHOLD and volume_ratio > SNIPER_VOLUME_MULTIPLIER
-    return SniperPanicScanResult(is_panic, price_drop_pct, volume_ratio)
-
-
-class SniperRiskManager:
-    """Ported from OwnerProtectiveRiskManager — identical conviction-score and
-    dynamic-risk formulas. consecutive_losses is DB-backed (control_flags)
-    rather than an in-memory attribute like the original prototype, because
-    THIS process gets restarted often (redeploys, manual `pkill -9`, crashes)
-    and an in-memory-only loss streak would silently reset to zero on every
-    restart — exactly the failure mode is_paused()/circuit_breaker/
-    is_live_mode() were already rewritten to avoid elsewhere in this file."""
-
-    def __init__(self, max_loss_streak: int, max_risk_fraction: float):
-        self.max_loss_streak = max_loss_streak
-        self.max_risk_fraction = max_risk_fraction
-
-    @property
-    def consecutive_losses(self) -> int:
-        return int(get_control_flag("sniper_consecutive_losses", "0") or 0)
-
-    @staticmethod
-    def compute_conviction(price_drop_pct: float, volume_ratio: float) -> float:
-        """Panic severity (drop size + volume spike) -> 0.5-0.95 score."""
-        drop_score = min(abs(price_drop_pct) / 0.03, 1.0)
-        vol_score = max(min((volume_ratio - 2.0) / 3.0, 1.0), 0.0)
-        conviction = 0.5 + 0.45 * ((drop_score + vol_score) / 2)
-        return round(float(min(conviction, 0.95)), 3)
-
-    def calculate_dynamic_risk(self, total_balance: float, conviction_score: float) -> float:
-        if self.consecutive_losses >= self.max_loss_streak:
-            return 0.0
-        risk_fraction = 0.015 + (0.025 * conviction_score)
-        return float(total_balance * min(risk_fraction, self.max_risk_fraction))
-
-    def record_result(self, success: bool):
-        set_control_flag("sniper_consecutive_losses", "0" if success else str(self.consecutive_losses + 1))
-
-
-sniper_risk_manager = SniperRiskManager(SNIPER_MAX_LOSS_STREAK, SNIPER_MAX_RISK_FRACTION)
-
-
-def _sniper_calculate_trade_levels(entry_price: float, lows: List[float]) -> Dict:
-    """Long-only: structural stop (recent swing low) vs a flat % stop,
-    whichever is more conservative — identical logic to the original
-    HybridSniperEngine._calculate_trade_levels()."""
-    recent_lows = [l for l in lows[-5:] if l is not None] or [entry_price]
-    structural_stop = min(recent_lows) * 0.998
-    pct_stop = entry_price * (1 - SNIPER_STOP_LOSS_PCT)
-    stop_loss = min(structural_stop, pct_stop)
-    stop_distance = entry_price - stop_loss
-    take_profit = entry_price + (stop_distance * SNIPER_TAKE_PROFIT_RR)
-    return {"stop_loss": stop_loss, "take_profit": take_profit, "stop_distance": stop_distance}
-
-
-def _sniper_evaluate_and_maybe_trade(candles: Dict, global_momentum: int):
-    """The synchronous equivalent of HybridSniperEngine.evaluate_and_execute()
-    + its order_executor callback, fused into one function and wired straight
-    to this bot's own safety gates and DB/order functions instead of a
-    generic callable."""
-    symbol, product_id = candles["symbol"], candles["product_id"]
-    closes, lows, volumes = candles["closes"], candles["lows"], candles["volumes"]
-
-    scan = _sniper_scan_for_panic_dip(closes, volumes)
-    if not scan.is_panic:
-        return  # WAITING_FOR_SETUP — deliberately not logged every cycle, would spam
-
-    if global_momentum == -1:  # panic-dip only ever longs; -1 vetoes, 0/1 don't
-        log_self_report("info", "hybrid_sniper",
-                         f"{symbol}: panic-dip detected but vetoed by broader-market trend",
-                         f"drop={scan.price_drop_pct:.2%} vol_ratio={scan.volume_ratio:.2f}x")
-        return
-
-    if product_id is None:
-        log.warning(f"[Sniper] panic-dip on {symbol} but couldn't resolve a product_id — skipping")
-        return
-
-    # Same fail-fast order as the webhook ENTRY path: credentials -> kill-switch
-    # -> [claim] -> paused -> circuit breaker, all BEFORE anything that spends
-    # money, and the claim lock closes the exact same double-entry race window
-    # the webhook path's own comment describes.
-    if is_live_mode() and API_CREDENTIALS_OK is False:
-        log_rejection(symbol, "HYBRID_SNIPER", "BUY", "invalid_credentials", API_CREDENTIALS_MSG or "")
-        return
-    if is_kill_switch_active():
-        log_rejection(symbol, "HYBRID_SNIPER", "BUY", "kill_switch", get_control_flag("kill_switch_reason", ""))
-        return
-    if not claim_symbol_for_entry(symbol):
-        return  # already in a trade on this symbol (sniper or Pine) — quietly skip
-
-    try:
-        if is_paused():
-            log_rejection(symbol, "HYBRID_SNIPER", "BUY", "paused", "bot is paused via dashboard/control")
-            return
-        cb_tripped, cb_reason = circuit_breaker_tripped()
-        if cb_tripped:
-            log_rejection(symbol, "HYBRID_SNIPER", "BUY", "circuit_breaker", cb_reason)
-            return
-
-        conviction_score = sniper_risk_manager.compute_conviction(scan.price_drop_pct, scan.volume_ratio)
-        balance = get_account_balance()
-        if balance is None or balance <= 0:
-            log_rejection(symbol, "HYBRID_SNIPER", "BUY", "no_balance", "couldn't fetch a live account balance")
-            return
-        risk_amount = sniper_risk_manager.calculate_dynamic_risk(balance, conviction_score)
-        if risk_amount <= 0:
-            log_self_report("info", "hybrid_sniper",
-                             f"{symbol}: panic-dip confirmed but sizing is in sleep-mode "
-                             f"({sniper_risk_manager.consecutive_losses} losses in a row) — capital protected",
-                             f"drop={scan.price_drop_pct:.2%} vol_ratio={scan.volume_ratio:.2f}x")
-            return
-
-        entry_price = closes[-1]
-        levels = _sniper_calculate_trade_levels(entry_price, lows)
-        if levels["stop_distance"] <= 0:
-            log.warning(f"[Sniper] {symbol}: degenerate stop distance, skipping")
-            return
-        qty = round(risk_amount / levels["stop_distance"], 6)
-        if qty <= 0:
-            return
-
-        ok, msg, order = place_entry_order(product_id, symbol, "BUY", qty)
-        if not ok:
-            log_rejection(symbol, "HYBRID_SNIPER", "BUY", "exchange_rejected", msg)
-            return
-
-        # Position recorded BEFORE the bracket call, same reasoning as the
-        # webhook ENTRY path's own comment: a real entry must be written
-        # down before anything else is attempted, full stop.
-        upsert_position({
-            "symbol": symbol, "signal": "HYBRID_SNIPER", "direction": "BUY",
-            "entry_price": entry_price, "entry_time": datetime.utcnow().isoformat(),
-            "qty": qty, "sl": levels["stop_loss"], "tp1": levels["take_profit"],
-            "product_id": product_id, "status": "open",
-            "confidence_score": round(conviction_score * 100, 1),
-            "confidence_reason": f"Kotegawa panic-dip: drop={scan.price_drop_pct:.2%}, "
-                                  f"vol_ratio={scan.volume_ratio:.2f}x, conviction={conviction_score:.2f}",
-        })
-        log_trade(symbol, "HYBRID_SNIPER", "BUY", "ENTRY", qty, entry_price, json.dumps(order),
-                  confidence_score=round(conviction_score * 100, 1),
-                  confidence_reason=f"drop={scan.price_drop_pct:.2%} vol_ratio={scan.volume_ratio:.2f}x")
-
-        bracket_ok, bracket_msg = place_bracket_order(product_id, symbol, levels["stop_loss"], levels["take_profit"])
-        urgent = "" if bracket_ok else "\n🚨 BRACKET FAILED — position may be UNPROTECTED. Check Delta manually."
-        notify_telegram(f"🎯 Hybrid Sniper: BUY {qty} {symbol} @ ~{entry_price:.4g}\n"
-                         f"SL={levels['stop_loss']:.4g} TP={levels['take_profit']:.4g} | "
-                         f"conviction={conviction_score:.2f} | risk=${risk_amount:.2f}\n{bracket_msg}{urgent}")
-        log.info(f"🎯 [Sniper] ENTRY {symbol}: qty={qty} entry={entry_price:.4g} "
-                 f"sl={levels['stop_loss']:.4g} tp={levels['take_profit']:.4g} conviction={conviction_score:.2f}")
-    finally:
-        force_release_if_still_entering(symbol)
-
-
-def _sniper_reconcile_closed_positions():
-    """
-    [FILLS THE ONE REAL GAP] Pine-driven positions get marked closed because
-    Pine itself sends a TRADE_CLOSE webhook when its SL/TP fires — nothing
-    plays that role for a sniper-opened position. Without this, a sniper
-    position would sit in this bot's DB as "open" forever once its bracket
-    fired. Two different closing mechanisms depending on mode:
-      • LIVE: a real bracket order is sitting on Delta. Check Delta's own
-        live position size for this product — once it's zero, the bracket
-        fired on the exchange.
-      • DRY RUN: no real order was ever sent, so Delta's position size for
-        this product is ALWAYS zero — checking it would incorrectly
-        "close" every dry-run trade on the very next cycle. Instead, this
-        simulates the same outcome a real bracket would have produced, by
-        checking the live market price against this row's own recorded
-        SL/TP1 (the same public, no-auth ticker call get_last_traded_price
-        already uses elsewhere in this file).
-    Known limitation: is_dry_run() is a single global toggle, not stored
-    per-trade — flipping LIVE/DRY RUN while a sniper trade is still open is
-    an accepted edge case, same as every other mode-dependent check in this
-    file (is_live_mode()/is_dry_run() are always read fresh, never frozen
-    at entry time).
-    """
-    try:
-        with db() as conn:
-            open_rows = [dict(r) for r in conn.execute(
-                "SELECT * FROM positions WHERE status='open' AND signal='HYBRID_SNIPER'").fetchall()]
-        for row in open_rows:
-            symbol, product_id = row["symbol"], row["product_id"]
-            entry = safe_float(row.get("entry_price")) or 0.0
-            sl = safe_float(row.get("sl"))
-            tp = safe_float(row.get("tp1"))
-            if not product_id or not entry:
-                continue
-
-            dry_run = is_dry_run()
-            if dry_run:
-                price = get_last_traded_price(product_id, symbol)
-                if price is None:
-                    continue
-                if sl is not None and price <= sl:
-                    outcome, exit_price = "LOSS", sl
-                elif tp is not None and price >= tp:
-                    outcome, exit_price = "WIN", tp
-                else:
-                    continue  # still "open" in the simulation — price hasn't reached either level yet
-            else:
-                result = _signed_request("GET", f"/v2/positions?product_id={product_id}")
-                live_size = 0.0
-                if result:
-                    pos_data = result.get("result", result)
-                    if isinstance(pos_data, list) and pos_data:
-                        live_size = safe_float(pos_data[0].get("size"), 0.0) or 0.0
-                    elif isinstance(pos_data, dict):
-                        live_size = safe_float(pos_data.get("size"), 0.0) or 0.0
-                if abs(live_size) > 1e-9:
-                    continue  # still open on the exchange — nothing to reconcile yet
-                exit_price = get_last_traded_price(product_id, symbol) or entry
-                outcome = "WIN" if exit_price > entry else ("LOSS" if exit_price < entry else "BREAKEVEN")
-
-            risk_dist = abs(entry - sl) if sl else None
-            r_multiple = ((exit_price - entry) / risk_dist) if (risk_dist and risk_dist > 0) else 0.0
-
-            delete_position(symbol)
-            log_trade(symbol, "HYBRID_SNIPER", "BUY", "TRADE_CLOSE", row.get("qty"), exit_price,
-                      json.dumps({"reconciled": True, "mode": "dry_run" if dry_run else "live"}),
-                      confidence_score=row.get("confidence_score"))
-            record_trade_outcome(outcome, r_multiple)
-            sniper_risk_manager.record_result(outcome != "LOSS")
-            tag = "(dry-run) " if dry_run else ""
-            log.info(f"🎯 [Sniper] {tag}reconciled closed position {symbol}: {outcome} ({r_multiple:+.2f}R)")
-            notify_telegram(f"🎯 Hybrid Sniper trade closed {tag}: {symbol} {outcome} ({r_multiple:+.2f}R)")
-    except Exception as e:
-        log.error(f"[Sniper] reconcile loop error: {e}\n{traceback.format_exc()}")
-
-
-def _hybrid_sniper_loop():
-    log.info(f"🎯 Hybrid Sniper Engine thread started — symbol={SNIPER_SYMBOL} "
-             f"resolution={SNIPER_RESOLUTION} interval={SNIPER_INTERVAL_S}s "
-             f"({'ENABLED' if sniper_enabled() else 'disabled — SNIPER_ENABLED=true or /control/<secret>/sniper?enabled=true to turn on'})")
-    while True:
-        try:
-            if sniper_enabled():
-                global_momentum = _sniper_check_global_momentum()
-                candles = fetch_recent_candles(SNIPER_SYMBOL, SNIPER_RESOLUTION, SNIPER_LOOKBACK)
-                if candles:
-                    _sniper_evaluate_and_maybe_trade(candles, global_momentum)
-                _sniper_reconcile_closed_positions()
-        except Exception as e:
-            log.error(f"[Sniper] loop error: {e}\n{traceback.format_exc()}")
-        time.sleep(SNIPER_INTERVAL_S)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
 # MISSION CONTROL — the visual dashboard
 # ────────────────────────────────────────────────────────────────────────────────
 # One page: live/dry badge, open positions, recent trades, pause/resume/close-all.
@@ -3857,8 +3604,11 @@ button{font-family:inherit;}
 .settings-row .k{color:var(--text-mid);}
 .settings-row .v{color:var(--text-hi);font-weight:600;font-family:var(--font-display);font-size:11.5px;text-align:right;}
 .settings-row .v.on{color:var(--lime);} .settings-row .v.off{color:var(--text-dim);} .settings-row .v.danger{color:var(--coral);}
-.signal-tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;margin:2px 3px 0 0;background:rgba(157,255,31,.1);color:var(--lime-soft);border:1px solid rgba(157,255,31,.25);}
+.signal-tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;margin:2px 3px 0 0;background:rgba(157,255,31,.1);color:var(--lime-soft);border:1px solid rgba(157,255,31,.25);cursor:pointer;user-select:none;transition:transform .1s ease,opacity .1s ease;}
 .signal-tag.off{background:rgba(255,255,255,.03);color:var(--text-dim);border-color:var(--panel-border);}
+.signal-tag:active{transform:scale(.9);}
+.settings-row.tappable{cursor:pointer;transition:opacity .1s ease;}
+.settings-row.tappable:active{opacity:.55;}
 
 .stat-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .stat-mini{background:rgba(255,255,255,.02);border:1px solid var(--panel-border);border-radius:10px;padding:11px 12px;}
@@ -4618,6 +4368,38 @@ button{font-family:inherit;}
       </div>
       <div id="backtestBody"><div class="tab-empty">Loading…</div></div>
     </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.1-3.5-3.5L4 15.7"/></svg>Historical Strategy Backtest</span>
+        <span class="count-pill" style="background:rgba(157,255,31,.08);color:var(--text-mid);border:1px solid var(--panel-border);">Real OHLCV</span>
+      </div>
+      <div class="settings-row" style="border:none;padding-top:0;">
+        <span style="max-width:100%;font-size:11px;line-height:1.5;color:var(--text-mid);">
+          Runs a <b style="color:var(--text-hi);">simplified EMA/RSI/ADX proxy strategy</b> against REAL historical
+          Delta candles — fees and slippage included. This is <b style="color:var(--coral);">not</b> a replica of your
+          full Pine Script (9 tiers, VSA Shield, KNN/ML ensemble aren't ported here) — it's a sanity floor: does a
+          basic trend approach have any edge on this symbol's real history at all.
+        </span>
+      </div>
+      <div class="act-row" style="margin-top:10px;">
+        <select id="btSymbol" class="act-btn" style="flex:1;">
+          <option value="BTCUSD">BTCUSD</option><option value="ETHUSD">ETHUSD</option>
+          <option value="SOLUSD">SOLUSD</option><option value="BNBUSD">BNBUSD</option>
+        </select>
+        <select id="btResolution" class="act-btn" style="flex:1;">
+          <option value="15m">15m</option><option value="1h" selected>1h</option><option value="1d">1D</option>
+        </select>
+      </div>
+      <div class="act-row" style="margin-top:8px;">
+        <select id="btDays" class="act-btn" style="flex:1;">
+          <option value="14">14 days</option><option value="30" selected>30 days</option>
+          <option value="60">60 days</option><option value="90">90 days</option>
+        </select>
+        <button class="act-btn primary" id="btnRunBacktest" style="flex:1;">Run Backtest</button>
+      </div>
+      <div id="btResults" style="margin-top:14px;"></div>
+    </div>
   </section>
 
   <!-- ================= SYSTEM SETTINGS ================= -->
@@ -4893,31 +4675,39 @@ async function callControl(action){
     return body;
   }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
 }
-/* [FIX — MISSING MODE/SIGNAL WIRING] Backend has had /mode/<secret> and
-   /signals/<secret> since before this dashboard existed, but nothing in
-   the JS ever called them — that's the "no live button" gap. Same
-   shape as callControl() above, just a different base path. */
-async function callMode(liveMode){
+// [PREMIUM FIX — LIVE/DRY-RUN + SIGNAL TIER CONTROLS] The backend has had
+// /mode/<secret> and /signals/<secret> for a while, but nothing in this
+// dashboard ever called them — Mode was rendered as a read-only label and
+// signal tiers weren't shown at all outside Settings, where they were also
+// just static tags. These three helpers follow the exact same shape as
+// callControl() above (GET-with-query, same error toast, same "not
+// connected" guard) so every button below behaves identically to the ones
+// that already worked.
+async function callMode(liveBool){
   if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
   try{
-    const res = await fetch(LIVE.baseUrl + '/mode/' + encodeURIComponent(LIVE.key) + '?live_mode=' + (liveMode?'true':'false'), { cache:'no-store' });
+    const res = await fetch(LIVE.baseUrl + '/mode/' + encodeURIComponent(LIVE.key) + '?live_mode=' + (liveBool?'true':'false'), { cache:'no-store' });
     const body = await res.json().catch(()=>({}));
-    if(!res.ok){
-      showToast('Action failed: ' + (body.error || res.status) + (res.status===403 ? ' — if APEX_CONTROL_PASSWORD is set separately on your bot, your connect key won\'t match it.' : ''));
-      return null;
-    }
+    if(!res.ok){ showToast('Mode change failed: ' + (body.error || res.status)); return null; }
     return body;
   }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
 }
-async function callSignalToggle(tier, enable){
+async function callSignalTier(tier, enable){
   if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
   try{
-    const res = await fetch(LIVE.baseUrl + '/signals/' + encodeURIComponent(LIVE.key) + '?' + (enable?'enable':'disable') + '=' + encodeURIComponent(tier), { cache:'no-store' });
+    const qp = (enable ? 'enable=' : 'disable=') + encodeURIComponent(tier);
+    const res = await fetch(LIVE.baseUrl + '/signals/' + encodeURIComponent(LIVE.key) + '?' + qp, { cache:'no-store' });
     const body = await res.json().catch(()=>({}));
-    if(!res.ok){
-      showToast('Action failed: ' + (body.error || res.status) + (res.status===403 ? ' — if APEX_CONTROL_PASSWORD is set separately on your bot, your connect key won\'t match it.' : ''));
-      return null;
-    }
+    if(!res.ok){ showToast('Signal tier update failed: ' + (body.error || res.status)); return null; }
+    return body;
+  }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
+}
+async function callRiskSizing(enabledBool){
+  if(!LIVE.enabled){ showToast('Connect your live bot first, Master.'); return null; }
+  try{
+    const res = await fetch(LIVE.baseUrl + '/control/' + encodeURIComponent(LIVE.key) + '/risk-sizing?enabled=' + (enabledBool?'true':'false'), { cache:'no-store' });
+    const body = await res.json().catch(()=>({}));
+    if(!res.ok){ showToast('Risk sizing update failed: ' + (body.error || res.status)); return null; }
     return body;
   }catch(e){ showToast('Network error — could not reach your bot.'); return null; }
 }
@@ -4934,21 +4724,13 @@ function renderAutopilotTab(){
   const cfg = LIVECACHE.config || {};
   const paused = !!cfg.paused, killed = !!cfg.kill_switch_active, live = !!cfg.live_mode;
   const cb = cfg.circuit_breaker || {};
-  // [FIX — MISSING MODE/SIGNAL WIRING] all_known_signals/active_signals both
-  // already come back from /config (cfgJ -> LIVECACHE.config in pollLive),
-  // just nothing rendered them as controls. Hardcoded fallback only covers
-  // the gap before the first successful poll.
-  const allTiers = (cfg.all_known_signals && cfg.all_known_signals.length) ? cfg.all_known_signals
-    : ['FAST','GHOST','NEXUS','PULLBACK','RECOVERY','SCALP','STRONG','WARP'];
-  const activeTiers = cfg.active_signals || [];
   let bannerClass='ok', bannerText = live ? 'LIVE — placing real orders' : 'DRY RUN — no real orders sent';
   if(paused){ bannerClass='paused'; bannerText='PAUSED — no new entries will be taken'; }
   if(killed){ bannerClass='danger'; bannerText='KILL SWITCH ARMED — all new entries blocked'; }
   body.innerHTML =
     '<div class="status-banner '+bannerClass+'"><span class="status-dot"></span>'+bannerText+'</div>'+
     '<div class="act-row">'+
-      '<button class="act-btn primary" id="btnGoDryRun" '+(!live?'disabled':'')+'>Switch to Dry Run<span class="sub">Simulated orders only — safe testing</span></button>'+
-      '<button class="act-btn danger" id="btnGoLive" '+(live?'disabled':'')+'>Go Live<span class="sub">Real orders will be placed on Delta</span></button>'+
+      '<button class="act-btn '+(live?'warn':'primary')+'" id="btnModeToggle">'+(live?'Switch to Dry Run':'Go Live')+'<span class="sub">'+(live?'Simulate only — nothing hits the exchange':'Start placing REAL orders on Delta')+'</span></button>'+
     '</div>'+
     '<div class="act-row">'+
       '<button class="act-btn primary" id="btnResume" '+(!paused?'disabled':'')+'>Resume Trading<span class="sub">Allow new entries again</span></button>'+
@@ -4962,12 +4744,6 @@ function renderAutopilotTab(){
       '<div class="settings-row"><span class="k">Circuit Breaker</span><span class="v '+(cb.tripped?'danger':'on')+'">'+(cb.tripped?'TRIPPED':'Clear')+'</span></div>'+
       '<div class="settings-row"><span class="k">Consecutive Losses</span><span class="v">'+(cb.consecutive_losses ?? '—')+' / '+(cb.max_consecutive_losses ?? '—')+'</span></div>'+
       '<div class="settings-row"><span class="k">Mode</span><span class="v '+(live?'danger':'on')+'">'+(live?'LIVE (real orders)':'DRY RUN (simulated)')+'</span></div>'+
-    '</div>'+
-    '<div class="panel" style="padding:14px;margin-top:10px;">'+
-      '<div class="settings-row" style="border-bottom:none;padding-bottom:6px;"><span class="k">Active Signal Tiers</span><span class="v" style="font-weight:500;font-size:10px;color:var(--text-dim);">tap to toggle</span></div>'+
-      '<div class="engine-chip-row" id="tierChipRow">'+
-        allTiers.map(t=>'<button type="button" class="engine-chip '+(activeTiers.includes(t)?'on':'off')+'" data-tier="'+t+'" style="cursor:pointer;">'+t+'</button>').join('')+
-      '</div>'+
     '</div>';
   document.getElementById('btnPause').onclick = ()=> confirmAction('Pause trading?',
     'No new entries will be taken until you resume. Positions already open keep running with their normal SL/TP/trailing logic — pausing does not touch them.',
@@ -4987,19 +4763,15 @@ function renderAutopilotTab(){
   document.getElementById('btnCloseAll').onclick = ()=> confirmAction('Close ALL open positions?',
     'Immediately market-closes every open position at whatever price is available right now — it does not wait for TP/SL levels, and this cannot be undone.',
     async ()=>{ const r = await callControl('close-all'); if(r){ showToast('Close-all sent.'); await pollLive(); renderAutopilotTab(); } });
-  document.getElementById('btnGoLive').onclick = ()=> confirmAction('Switch to LIVE mode?',
-    'The bot will start placing REAL orders on Delta Exchange with real money, using whatever position sizing and risk settings are currently configured. Make sure those are correct before continuing.',
-    async ()=>{ const r = await callMode(true); if(r){ showToast('LIVE mode enabled — real orders will now be placed.'); await pollLive(); renderAutopilotTab(); } });
-  document.getElementById('btnGoDryRun').onclick = async ()=>{
-    const r = await callMode(false); if(r){ showToast('DRY RUN mode enabled — no real orders will be sent.'); await pollLive(); renderAutopilotTab(); }
+  document.getElementById('btnModeToggle').onclick = ()=>{
+    if(live){
+      (async ()=>{ const r = await callMode(false); if(r){ showToast('Switched to DRY RUN — simulated orders only.'); await pollLive(); renderAutopilotTab(); if(document.getElementById('view-settings') && !document.getElementById('view-settings').hidden) renderSettingsTab(); } })();
+    } else {
+      confirmAction('Go LIVE?',
+        'This switches the bot to placing REAL orders with real money on your connected exchange account. Double-check position sizing and active signal tiers first — Close All and Kill Switch still work independently if something goes wrong.',
+        async ()=>{ const r = await callMode(true); if(r){ showToast('LIVE — placing real orders now.'); await pollLive(); renderAutopilotTab(); if(document.getElementById('view-settings') && !document.getElementById('view-settings').hidden) renderSettingsTab(); } });
+    }
   };
-  document.querySelectorAll('#tierChipRow .engine-chip').forEach(chip=>{
-    chip.onclick = async ()=>{
-      const tier = chip.dataset.tier, isOn = chip.classList.contains('on');
-      const r = await callSignalToggle(tier, !isOn);
-      if(r){ showToast((isOn?'Disabled ':'Enabled ')+tier+' tier.'); await pollLive(); renderAutopilotTab(); }
-    };
-  });
 }
 
 function renderVaultTab(){
@@ -5071,6 +4843,62 @@ function renderBacktestTab(){
     '<div style="font-size:9.5px;color:var(--text-dim);margin-top:10px;line-height:1.5;">Reconstructed from your real trades log (ENTRY paired with its EXIT_TP1/TP2/TP3/SL/MANUAL fills) — there\'s no stored pnl column, so every number here is computed from actual logged fill prices, not estimated. Only fully-closed positions count; anything still open is excluded.</div>';
 }
 
+function renderBacktestResult(container, label, s){
+  if(!s){ return '<div class="tab-empty" style="padding:16px;">'+label+': no completed trades in this window.</div>'; }
+  const pf = isFinite(s.profit_factor) ? s.profit_factor.toFixed(2) : '∞';
+  const curve = s.equity_curve_pct, w=300, h=70;
+  const minV = Math.min(0,...curve), maxV = Math.max(0,...curve), range=(maxV-minV)||1;
+  const pts = curve.map((v,i)=>(i/(Math.max(curve.length-1,1)))*w+','+(h-((v-minV)/range)*h)).join(' ');
+  const zeroY = h-((0-minV)/range)*h;
+  return '<div class="panel-title" style="font-size:10px;margin-bottom:8px;">'+label+'</div>'+
+    '<div class="stat-mini-grid">'+
+      '<div class="stat-mini"><div class="lbl">Trades</div><div class="val">'+s.total_trades+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Win Rate</div><div class="val '+(s.win_rate>=50?'pos':'neg')+'">'+s.win_rate.toFixed(1)+'%</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Profit Factor</div><div class="val '+(s.profit_factor>=1?'pos':'neg')+'">'+pf+'</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Net Return</div><div class="val '+(s.net_return_pct>=0?'pos':'neg')+'">'+s.net_return_pct.toFixed(2)+'%</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Max Drawdown</div><div class="val neg">'+s.max_drawdown_pct.toFixed(2)+'%</div></div>'+
+      '<div class="stat-mini"><div class="lbl">Expectancy/Trade</div><div class="val '+(s.expectancy_pct>=0?'pos':'neg')+'">'+s.expectancy_pct.toFixed(3)+'%</div></div>'+
+    '</div>'+
+    '<div class="equity-wrap" style="margin-top:8px;"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none">'+
+      '<line x1="0" y1="'+zeroY+'" x2="'+w+'" y2="'+zeroY+'" stroke="rgba(255,255,255,.12)" stroke-width="1"/>'+
+      '<polyline points="'+pts+'" fill="none" stroke="'+(s.net_return_pct>=0?'#9dff1f':'#ff4f6d')+'" stroke-width="2"/>'+
+    '</svg></div>';
+}
+async function runHistoricalBacktest(){
+  const btn = document.getElementById('btnRunBacktest');
+  const out = document.getElementById('btResults');
+  if(!LIVE.enabled){
+    out.innerHTML = '<div class="tab-empty">Connect your live bot first — this fetches real historical candles through your backend.<button class="connect-cta" type="button" id="btConnectCta2">Connect Now</button></div>';
+    document.getElementById('btConnectCta2').onclick = (e)=>{ e.stopPropagation(); document.getElementById('connectPop').hidden = false; };
+    return;
+  }
+  const symbol = document.getElementById('btSymbol').value;
+  const resolution = document.getElementById('btResolution').value;
+  const days = document.getElementById('btDays').value;
+  btn.disabled = true; btn.textContent = 'Running…';
+  out.innerHTML = '<div class="tab-empty">Fetching real Delta history and simulating trades — a few seconds…</div>';
+  try{
+    const j = await liveFetch('/backtest/run?symbol='+encodeURIComponent(symbol)+'&resolution='+encodeURIComponent(resolution)+'&days='+encodeURIComponent(days));
+    if(!j || j.error){
+      out.innerHTML = '<div class="tab-empty">Could not run backtest: '+((j&&j.error)||'unknown error')+(j&&j.detail?' — '+j.detail:'')+'</div>';
+      return;
+    }
+    const wf = j.walk_forward;
+    out.innerHTML =
+      renderBacktestResult(out, 'Full Period ('+j.candles_used+' candles, '+j.days+'d)', j.full_period) +
+      '<div style="height:16px;"></div>' +
+      renderBacktestResult(out, 'In-Sample (first 70%)', wf.in_sample) +
+      '<div style="height:16px;"></div>' +
+      renderBacktestResult(out, 'Out-of-Sample (last 30%, unseen)', wf.out_of_sample) +
+      '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">'+j.methodology_note+' Fees+slippage: '+
+      (j.params.fee_pct_roundtrip+j.params.slippage_pct_roundtrip)+'% round-trip deducted from every simulated trade. '+
+      '<b style="color:var(--text-mid);">If Out-of-Sample looks much worse than In-Sample, that\'s a real overfitting/regime-change warning — don\'t just trust the Full Period number.</b></div>';
+  }catch(e){
+    out.innerHTML = '<div class="tab-empty">Request failed: '+e.message+'</div>';
+  }finally{
+    btn.disabled = false; btn.textContent = 'Run Backtest';
+  }
+}
 function renderSettingsTab(){
   const body = document.getElementById('settingsBody');
   if(!LIVE.enabled){
@@ -5084,29 +4912,54 @@ function renderSettingsTab(){
   if(!c){ body.innerHTML = '<div class="tab-empty">Loading configuration…</div>'; return; }
   const flag = (label,on) => '<div class="settings-row"><span class="k">'+label+'</span><span class="v '+(on?'on':'off')+'">'+(on?'ON':'OFF')+'</span></div>';
   const active = new Set((c.active_signals||[]).map(s=>s.toUpperCase()));
-  const tags = (c.all_known_signals||c.active_signals||[]).map(s=>
-    '<span class="signal-tag '+(active.has(s.toUpperCase())?'':'off')+'">'+s+'</span>').join('') || '—';
+  const tags = (c.all_known_signals||c.active_signals||[]).map(s=>{
+    const isOn = active.has(s.toUpperCase());
+    return '<span class="signal-tag '+(isOn?'':'off')+'" data-tier="'+s+'" data-on="'+(isOn?'1':'0')+'">'+s+'</span>';
+  }).join('') || '—';
   const td = c.time_drift || {};
   body.innerHTML =
     '<div class="settings-row"><span class="k">Region</span><span class="v">'+(c.region||'—')+'</span></div>'+
-    '<div class="settings-row"><span class="k">Mode</span><span class="v '+(c.live_mode?'danger':'on')+'">'+(c.live_mode?'LIVE':'DRY RUN')+'</span></div>'+
+    '<div class="settings-row tappable" id="settingsModeRow"><span class="k">Mode <span style="opacity:.5;font-size:9px;">(tap to switch)</span></span><span class="v '+(c.live_mode?'danger':'on')+'">'+(c.live_mode?'LIVE':'DRY RUN')+'</span></div>'+
     '<div class="settings-row"><span class="k">Paused</span><span class="v '+(c.paused?'off':'on')+'">'+(c.paused?'YES':'NO')+'</span></div>'+
     '<div class="settings-row"><span class="k">Kill Switch</span><span class="v '+(c.kill_switch_active?'danger':'on')+'">'+(c.kill_switch_active?'ARMED':'clear')+'</span></div>'+
     '<div class="settings-row"><span class="k">Auto Bracket Orders</span><span class="v '+(c.auto_bracket_orders?'on':'off')+'">'+(c.auto_bracket_orders?'ON':'OFF')+'</span></div>'+
     '<div class="settings-row"><span class="k">API Credentials</span><span class="v '+(c.api_credentials_ok?'on':'danger')+'">'+(c.api_credentials_ok?'OK':'CHECK')+'</span></div>'+
     '<div class="settings-row"><span class="k">Products Discovered</span><span class="v">'+(c.products_discovered ?? '—')+'</span></div>'+
     '<div class="settings-row"><span class="k">Clock Drift</span><span class="v '+((td.drift_ms==null||Math.abs(td.drift_ms)<1000)?'on':'danger')+'">'+(td.drift_ms!=null?Math.round(td.drift_ms)+'ms':'—')+'</span></div>'+
-    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Signal Tiers</div>'+
+    '<div class="panel-title" style="margin:16px 0 6px;font-size:10.5px;">Active Signal Tiers <span style="opacity:.5;font-weight:400;text-transform:none;">(tap to enable/disable)</span></div>'+
     '<div>'+tags+'</div>'+
     '<div class="panel-title" style="margin:18px 0 2px;font-size:10.5px;">Feature Flags</div>'+
     flag('HFT Parallel Exits', c.hft_parallel_exits) +
     flag('Predator Vision', c.predator_vision_enabled) +
-    flag('Risk-Based Sizing', c.risk_based_sizing) +
+    '<div class="settings-row tappable" id="riskSizingRow"><span class="k">Risk-Based Sizing <span style="opacity:.5;font-size:9px;">(tap to toggle)</span></span><span class="v '+(c.risk_based_sizing?'on':'off')+'">'+(c.risk_based_sizing?'ON':'OFF')+'</span></div>'+
     flag('Aggressive Exits', c.aggressive_exits_enabled) +
     flag('Neural Syndicate', c.neural_syndicate_enabled) +
     flag('Shock Entry Block', c.block_entries_during_shock) +
     flag('Telegram Alerts', c.telegram_enabled) +
-    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">Read-only — this mirrors your bot\'s real /config response. Changing any of these requires an env var change + redeploy, not a toggle here, so nothing on this screen can silently drift from what\'s actually running.</div>';
+    '<div style="font-size:9.5px;color:var(--text-dim);margin-top:14px;line-height:1.5;">Mode, Active Signal Tiers and Risk-Based Sizing above are live — tap any of them to change it right now. Everything else on this screen is boot-time only: changing it means an env var + redeploy, not a toggle here, so it can\'t silently drift from what\'s actually running.</div>';
+
+  const modeRow = document.getElementById('settingsModeRow');
+  if(modeRow) modeRow.onclick = ()=>{
+    if(c.live_mode){
+      (async ()=>{ const r = await callMode(false); if(r){ showToast('Switched to DRY RUN.'); await pollLive(); renderSettingsTab(); if(document.getElementById('view-autopilot') && !document.getElementById('view-autopilot').hidden) renderAutopilotTab(); } })();
+    } else {
+      confirmAction('Go LIVE?',
+        'This switches the bot to placing REAL orders with real money on your connected exchange account.',
+        async ()=>{ const r = await callMode(true); if(r){ showToast('LIVE — placing real orders now.'); await pollLive(); renderSettingsTab(); if(document.getElementById('view-autopilot') && !document.getElementById('view-autopilot').hidden) renderAutopilotTab(); } });
+    }
+  };
+  const riskRow = document.getElementById('riskSizingRow');
+  if(riskRow) riskRow.onclick = async ()=>{
+    const r = await callRiskSizing(!c.risk_based_sizing);
+    if(r){ showToast('Risk-based sizing turned '+(r.risk_based_sizing?'ON':'OFF')+'.'); await pollLive(); renderSettingsTab(); }
+  };
+  body.querySelectorAll('.signal-tag[data-tier]').forEach(el=>{
+    el.onclick = async ()=>{
+      const tier = el.dataset.tier, isOn = el.dataset.on === '1';
+      const r = await callSignalTier(tier, !isOn);
+      if(r){ showToast(tier + ' ' + (isOn?'disabled':'enabled') + '.'); await pollLive(); renderSettingsTab(); }
+    };
+  });
 }
 
 function renderAiOracle(oracleJ){
@@ -6272,6 +6125,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   renderNews();
   renderGatekeeper();
   renderRiskPanel();
+  document.getElementById('btnRunBacktest').onclick = runHistoricalBacktest;
   renderHeatmap();
   buildWaveform();
   loadCandles('1m');
@@ -6867,28 +6721,6 @@ def mark_prices():
     return jsonify({"prices": prices})
 
 
-@app.route("/candles", methods=["GET"])
-@require_key
-def candles_route():
-    """[GAP FIX] The dashboard's own chart JS (loadCandles() / TF_TO_DELTA_RES)
-    has called GET /candles?symbol=..&resolution=..&limit=.. since the
-    dashboard was built, but this route never actually existed server-side —
-    every chart load 404'd silently and fell back to seedCandles()'s
-    simulated random walk. Proxies Delta's public /v2/history/candles so the
-    browser never talks to the exchange directly, reusing the exact same
-    fetch_recent_candles() the Hybrid Sniper engine uses for its own scan."""
-    symbol = request.args.get("symbol", SNIPER_SYMBOL)
-    resolution = request.args.get("resolution", "5m")
-    limit = safe_int(request.args.get("limit"), 60) or 60
-    data = fetch_recent_candles(symbol, resolution, limit)
-    if not data:
-        return jsonify({"candles": []}), 200
-    candles = [{"time": t, "open": o, "high": h, "low": l, "close": c}
-               for t, o, h, l, c in zip(data["times"], data["opens"], data["highs"],
-                                          data["lows"], data["closes"])]
-    return jsonify({"candles": candles}), 200
-
-
 @app.route("/ai-oracle", methods=["GET"])
 @require_key
 def ai_oracle_endpoint():
@@ -6980,22 +6812,6 @@ def control_risk_sizing(secret):
     set_risk_sizing_enabled(enabled)
     notify_telegram(f"⚙️ Dynamic (risk-based) position sizing turned {'ON' if enabled else 'OFF'}")
     return jsonify({"status": "ok", "risk_based_sizing": enabled})
-
-
-@app.route("/control/<secret>/sniper", methods=["GET"])
-def control_sniper(secret):
-    """[HYBRID SNIPER NEW] Turns the merged-in-process panic-dip engine on/off
-    at runtime — same pattern as /control/<secret>/risk-sizing above.
-    ?enabled=true|false required. OFF by default (SNIPER_ENABLED=false env)."""
-    if secret != CONTROL_PASSWORD:
-        return jsonify({"error": "unauthorized"}), 403
-    raw = request.args.get("enabled")
-    if raw is None or raw.strip().lower() not in ("true", "false"):
-        return jsonify({"error": "pass ?enabled=true or ?enabled=false"}), 400
-    enabled = raw.strip().lower() == "true"
-    set_sniper_enabled(enabled)
-    notify_telegram(f"🎯 Hybrid Sniper Engine turned {'ON' if enabled else 'OFF'}")
-    return jsonify({"status": "ok", "hybrid_sniper_enabled": enabled})
 
 
 @app.route("/control/<secret>/kill-switch", methods=["GET", "POST"])
@@ -7285,15 +7101,6 @@ def config_snapshot():
             "symbol": get_control_flag("ai_consensus_symbol"),
             "updated_at": get_control_flag("ai_consensus_updated_at"),
         },
-        # [HYBRID SNIPER NEW] Read-only status for the merged-in-process
-        # panic-dip engine — off by default, toggled via /control/<secret>/sniper.
-        "hybrid_sniper": {
-            "enabled": sniper_enabled(),
-            "symbol": SNIPER_SYMBOL,
-            "resolution": SNIPER_RESOLUTION,
-            "consecutive_losses": sniper_risk_manager.consecutive_losses,
-            "max_loss_streak": SNIPER_MAX_LOSS_STREAK,
-        },
     }), 200
 
 
@@ -7368,6 +7175,333 @@ def signals_control(secret):
         notify_telegram(f"⚙️ Active signal tiers now: {', '.join(sorted(get_active_signals())) or '(none)'}")
 
     return jsonify({"active_signals": sorted(get_active_signals()), "all_known_signals": ALL_KNOWN_SIGNALS}), 200
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# [ARCHITECTURE LAYER — NEW] Config / BrokerAdapter / BrokerManager /
+# DatabaseLayer / HealthMonitor / WebhookHandler
+# ────────────────────────────────────────────────────────────────────────────────
+# Everything below is ADDITIVE. Not one existing class, function, route, or
+# global above this line is modified, removed, or called differently than
+# before. Every method here either (a) reads an already-defined global, or
+# (b) delegates straight to an already-defined function — so there is still
+# exactly ONE place that actually talks to Delta, touches the database, or
+# decides trade logic. This section only adds a clean OOP seam around that
+# single source of truth, for two concrete reasons:
+#   1. A second broker can be added later by writing one new BrokerAdapter
+#      subclass — no route, webhook, or trading logic needs to change.
+#   2. One object (health_monitor) can be asked "is everything OK right now"
+#      instead of that answer being scattered across six different routes.
+# The live POST /webhook/<secret_token> route above is deliberately NOT
+# rewired to go through WebhookHandler — its control flow (atomic symbol
+# claim → kill-switch → circuit breaker → AI gate → order) is exactly right
+# today, and refactoring it is out of scope for "verify no existing behavior
+# changes". WebhookHandler exists as validation infrastructure for a FUTURE
+# second alert source, not a replacement of the current one.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ---- Config Layer -----------------------------------------------------------
+@dataclass(frozen=True)
+class AppConfig:
+    """Read-only snapshot of the settings this process actually booted with.
+    Every field is read from the SAME env-parsed globals defined at the top
+    of this file (REGION, BASE_URL, CIRCUIT_BREAKER_ENABLED, ...) — nothing
+    here re-parses an env var or introduces a second definition of what it
+    means. Secrets (API_KEY/API_SECRET/WEBHOOK_SECRET_TOKEN) are deliberately
+    exposed only as booleans, never as values, since this backs a JSON route."""
+    region: str
+    base_url: str
+    live_mode_default: bool
+    circuit_breaker_enabled: bool
+    daily_loss_limit_r: float
+    max_consecutive_losses: int
+    auto_bracket_orders: bool
+    webhook_configured: bool
+    credentials_configured: bool
+
+    @classmethod
+    def snapshot(cls) -> "AppConfig":
+        return cls(
+            region=REGION,
+            base_url=BASE_URL,
+            live_mode_default=LIVE_MODE_ENV_DEFAULT,
+            circuit_breaker_enabled=CIRCUIT_BREAKER_ENABLED,
+            daily_loss_limit_r=DAILY_LOSS_LIMIT_R,
+            max_consecutive_losses=MAX_CONSECUTIVE_LOSSES,
+            auto_bracket_orders=AUTO_BRACKET_ORDERS,
+            webhook_configured=bool(WEBHOOK_SECRET_TOKEN),
+            credentials_configured=bool(API_KEY and API_SECRET),
+        )
+
+    def as_dict(self) -> Dict:
+        return {
+            "region": self.region, "base_url": self.base_url,
+            "live_mode_default": self.live_mode_default,
+            "circuit_breaker_enabled": self.circuit_breaker_enabled,
+            "daily_loss_limit_r": self.daily_loss_limit_r,
+            "max_consecutive_losses": self.max_consecutive_losses,
+            "auto_bracket_orders": self.auto_bracket_orders,
+            "webhook_configured": self.webhook_configured,
+            "credentials_configured": self.credentials_configured,
+        }
+
+
+# ---- Broker Adapter Layer ----------------------------------------------------
+class BrokerAdapter(ABC):
+    """Common interface every broker integration exposes. Delta is the only
+    adapter with real credentials today; a second exchange joins later by
+    implementing this interface once — nothing else in the file needs to
+    know about it."""
+    name: str = "unnamed"
+
+    @abstractmethod
+    def resolve_product(self, symbol: str) -> Optional[int]: ...
+
+    @abstractmethod
+    def get_balance(self) -> Optional[float]: ...
+
+    @abstractmethod
+    def get_position(self, symbol: str) -> Optional[Dict]: ...
+
+    @abstractmethod
+    def get_last_price(self, product_id: int, symbol: str) -> Optional[float]: ...
+
+    @abstractmethod
+    def place_bracket_order(self, product_id: int, symbol: str, sl_price, tp_price,
+                             direction: str, qty: float): ...
+
+    @abstractmethod
+    def place_exit_order(self, product_id: int, symbol: str, direction: str, qty: float): ...
+
+    @abstractmethod
+    def is_configured(self) -> bool: ...
+
+
+class DeltaBroker(BrokerAdapter):
+    """Delegates every call straight to the existing, already-live Delta
+    functions defined earlier in this file (resolver.resolve,
+    get_account_balance, place_bracket_order, ...). Zero duplicated trading
+    logic — this can never drift out of sync with the real order path
+    because it never re-implements it, only names it."""
+    name = "delta"
+
+    def resolve_product(self, symbol: str) -> Optional[int]:
+        return resolver.resolve(symbol)
+
+    def get_balance(self) -> Optional[float]:
+        return get_account_balance()
+
+    def get_position(self, symbol: str) -> Optional[Dict]:
+        return get_position(symbol)
+
+    def get_last_price(self, product_id: int, symbol: str) -> Optional[float]:
+        return get_last_traded_price(product_id, symbol)
+
+    def place_bracket_order(self, product_id: int, symbol: str, sl_price, tp_price,
+                             direction: str, qty: float):
+        return place_bracket_order(product_id, symbol, sl_price, tp_price, direction, qty)
+
+    def place_exit_order(self, product_id: int, symbol: str, direction: str, qty: float):
+        return place_exit_order(product_id, symbol, direction, qty)
+
+    def is_configured(self) -> bool:
+        return bool(API_KEY and API_SECRET) and API_CREDENTIALS_OK is not False
+
+
+class BrokerManager:
+    """Thread-safe registry + hot-switch point for broker adapters. Only
+    'delta' is registered today; register() lets a future broker join
+    without touching this class, any route, or the webhook."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._brokers: Dict[str, BrokerAdapter] = {}
+        self._active: Optional[str] = None
+
+    def register(self, broker: BrokerAdapter, make_active: bool = False):
+        with self._lock:
+            self._brokers[broker.name] = broker
+            if make_active or self._active is None:
+                self._active = broker.name
+
+    def switch(self, name: str) -> Tuple[bool, str]:
+        with self._lock:
+            if name not in self._brokers:
+                return False, f"unknown broker '{name}' — registered: {list(self._brokers)}"
+            self._active = name
+            return True, f"active broker switched to '{name}'"
+
+    def active(self) -> Optional[BrokerAdapter]:
+        with self._lock:
+            return self._brokers.get(self._active)
+
+    def status(self) -> Dict:
+        with self._lock:
+            return {
+                "active": self._active,
+                "registered": [{"name": n, "configured": b.is_configured()}
+                               for n, b in self._brokers.items()],
+            }
+
+
+broker_manager = BrokerManager()
+broker_manager.register(DeltaBroker(), make_active=True)
+
+
+# ---- Database Layer (thin, additive wrapper) ---------------------------------
+class DatabaseLayer:
+    """Generic query helpers built on top of the existing db()/init_db().
+    Every existing call site in this file (`with db() as conn: ...`) is
+    completely untouched and keeps behaving exactly as before — this class
+    is only a convenience surface for new code, never a replacement."""
+
+    @staticmethod
+    def execute(query: str, params: Tuple = ()) -> int:
+        with db() as conn:
+            cur = conn.execute(query, params)
+            conn.commit()
+            return cur.lastrowid
+
+    @staticmethod
+    def query_one(query: str, params: Tuple = ()) -> Optional[Dict]:
+        with db() as conn:
+            row = conn.execute(query, params).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def query_all(query: str, params: Tuple = ()) -> List[Dict]:
+        with db() as conn:
+            return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+
+# ---- Health Monitor -----------------------------------------------------------
+class HealthMonitor:
+    """Periodic, strictly read-only health snapshot: DB reachability, Delta
+    API reachability, clock drift, circuit-breaker/kill-switch state,
+    credential status, active broker. This NEVER places, modifies, or closes
+    a trade — it only ever writes to its own in-memory snapshot, the same
+    pattern already used by the existing _raw_api_log deque above."""
+
+    def __init__(self, interval_s: int = 60):
+        self.interval_s = interval_s
+        self._lock = threading.Lock()
+        self._last: Dict = {}
+
+    def check_once(self) -> Dict:
+        db_ok, db_err = True, None
+        try:
+            with db() as conn:
+                conn.execute("SELECT 1").fetchone()
+        except Exception as e:
+            db_ok, db_err = False, str(e)
+
+        delta_ok, delta_err = True, None
+        try:
+            resp = delta_http.get(f"{BASE_URL}/v2/products", params={"page_size": 1}, timeout=5)
+            resp.raise_for_status()
+        except Exception as e:
+            delta_ok, delta_err = False, str(e)
+
+        cb_tripped, cb_reason = circuit_breaker_tripped()
+        snapshot = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "database": {"ok": db_ok, "error": db_err},
+            "delta_api": {"ok": delta_ok, "error": delta_err},
+            "clock_drift_ms": round(get_time_drift_ms(), 1),
+            "circuit_breaker": {"tripped": cb_tripped, "reason": cb_reason},
+            "kill_switch_active": is_kill_switch_active(),
+            "credentials_ok": API_CREDENTIALS_OK,
+            "broker": broker_manager.status(),
+        }
+        with self._lock:
+            self._last = snapshot
+        return snapshot
+
+    def latest(self) -> Dict:
+        with self._lock:
+            return dict(self._last) if self._last else {}
+
+    def run_loop(self):
+        while True:
+            try:
+                self.check_once()
+            except Exception as e:
+                log.error(f"HealthMonitor check failed: {e}\n{traceback.format_exc()}")
+            time.sleep(self.interval_s)
+
+
+health_monitor = HealthMonitor(interval_s=int(os.environ.get("HEALTH_MONITOR_INTERVAL_S", "60")))
+
+
+# ---- Webhook Handler (validation layer — NOT wired into the live route) ------
+class WebhookHandler:
+    """Stateless validation/parsing helpers that mirror what POST
+    /webhook/<secret_token> already checks inline, above. Deliberately NOT
+    called by that live route: its exact control flow (atomic symbol claim,
+    kill-switch/circuit-breaker ordering, TRADE_CLOSE short-circuit) is
+    already correct and battle-tested, and rewriting it to funnel through
+    here would risk exactly the behavior change this merge was told never to
+    make. This class is for a FUTURE second alert source (another route,
+    another broker's webhook) that wants the same validation without
+    copy-pasting it — it is genuinely new capability, not a hidden refactor
+    of the current path."""
+
+    def __init__(self, secret_token: str):
+        self.secret_token = secret_token
+
+    def is_authorized(self, provided_token: str) -> bool:
+        return bool(self.secret_token) and hmac.compare_digest(provided_token, self.secret_token)
+
+    def parse(self, data: Dict) -> Dict:
+        return {
+            "signal": str(f(data, "signal", "")).strip().upper(),
+            "direction": str(f(data, "direction", "")).strip().upper(),
+            "action": str(f(data, "action", "ENTRY")).strip().upper(),
+            "symbol": str(f(data, "symbol", "")).strip().upper(),
+        }
+
+    def is_valid(self, parsed: Dict) -> Tuple[bool, Optional[str]]:
+        if not parsed["signal"] or not parsed["symbol"]:
+            return False, "missing signal or symbol"
+        if parsed["signal"] not in get_active_signals():
+            return False, "signal_not_active"
+        return True, None
+
+
+webhook_handler = WebhookHandler(WEBHOOK_SECRET_TOKEN)
+
+
+# ---- New routes exposing the architecture layer above ------------------------
+# All three paths are brand-new (/config-layer, /broker/status, /broker/health,
+# /control/<secret>/broker/switch/<name>) — none collide with any existing
+# route, and none of them are called by any existing route either.
+@app.route("/config-layer", methods=["GET"])
+@require_key
+def config_layer_view():
+    return jsonify(AppConfig.snapshot().as_dict())
+
+
+@app.route("/broker/status", methods=["GET"])
+@require_key
+def broker_status_view():
+    return jsonify(broker_manager.status())
+
+
+@app.route("/broker/health", methods=["GET"])
+@require_key
+def broker_health_view():
+    snap = health_monitor.latest() or health_monitor.check_once()
+    return jsonify(snap)
+
+
+@app.route("/control/<secret>/broker/switch/<name>", methods=["GET"])
+def control_broker_switch(secret, name):
+    if secret != CONTROL_PASSWORD:
+        return jsonify({"error": "unauthorized"}), 403
+    ok, msg = broker_manager.switch(name)
+    if ok:
+        notify_telegram(f"🔀 Active broker switched to '{name}'")
+    return jsonify({"status": "ok" if ok else "error", "detail": msg}), (200 if ok else 400)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7451,7 +7585,10 @@ Region: {REGION} | Base: {BASE_URL} | Live (env default): {LIVE_MODE_ENV_DEFAULT
     threading.Thread(target=_ai_oracle_loop, daemon=True).start()
     log.info(f"🔮 AI Oracle merged in-process — symbols={ORACLE_SYMBOLS}, every {ORACLE_INTERVAL_S}s "
              f"(ensemble: Gemini + quant model, gate_trades={AI_ORACLE_GATE_TRADES})")
-    threading.Thread(target=_hybrid_sniper_loop, daemon=True).start()
+
+    threading.Thread(target=health_monitor.run_loop, daemon=True).start()
+    log.info(f"🩺 HealthMonitor started (every {health_monitor.interval_s}s) — "
+             f"broker_manager active='{broker_manager.status()['active']}'")
     if AGGRESSIVE_EXITS_ENABLED:
         threading.Thread(target=_aggressive_exits_loop, daemon=True).start()
         log.info(f"🎯 Aggressive Exits monitor started (breakeven +{BREAKEVEN_TRIGGER_R}R, "
