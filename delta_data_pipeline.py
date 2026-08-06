@@ -75,6 +75,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("delta_data_pipeline")
 
+
+DATA_DIR = "delta_dataset"
+
+
+def save_dataframe(df: pd.DataFrame, path: str) -> str:
+    """Persist a normalized market-data DataFrame as CSV for ML research."""
+    import os
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    out = df.copy()
+    out.to_csv(path, index=True, index_label="timestamp")
+    logger.info("saved %s rows -> %s", len(out), path)
+    return path
+
+
+
 _RESOLUTION_SECONDS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
     "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
@@ -286,24 +301,55 @@ class DeltaLiveFeed:
 # Demo / sanity check — run directly: python delta_data_pipeline.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("\n=== 1) Historical backfill (30d, quick check — bump to 90-180d for real training) ===")
+    # ---------------------------------------------------------------
+    # DATA EXPORT MODE
+    # This does NOT touch the existing live trading bot or API keys.
+    # It only downloads public Delta India market data and saves files.
+    # ---------------------------------------------------------------
+    import os
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    DAYS_BACK = 30  # first test; change to 180 after successful verification
+
+    print(f"\n=== 1) Historical backfill ({DAYS_BACK}d) ===")
     hist = DeltaHistoricalFetcher()
-    df_hist = hist.fetch_range(symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION, days_back=30)
+    df_hist = hist.fetch_range(
+        symbol=DEFAULT_SYMBOL,
+        resolution=DEFAULT_RESOLUTION,
+        days_back=DAYS_BACK,
+    )
+
+    historical_path = (
+        f"{DATA_DIR}/{DEFAULT_SYMBOL}_{DEFAULT_RESOLUTION}_{DAYS_BACK}d.csv"
+    )
+    save_dataframe(df_hist, historical_path)
+
     print(df_hist.tail())
     print(f"rows: {len(df_hist)}")
+    print(f"SAVED: {historical_path}")
 
     print("\n=== 2) Live feed — watching for 90s (Ctrl+C to stop early) ===")
-    feed = DeltaLiveFeed(symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION).start()
+    feed = DeltaLiveFeed(
+        symbol=DEFAULT_SYMBOL,
+        resolution=DEFAULT_RESOLUTION
+    ).start()
+
     try:
         time.sleep(90)
     except KeyboardInterrupt:
         pass
+
     feed.stop()
     df_live = feed.get_dataframe()
+
+    live_path = f"{DATA_DIR}/{DEFAULT_SYMBOL}_{DEFAULT_RESOLUTION}_live_snapshot.csv"
+    save_dataframe(df_live, live_path)
+
     print(df_live.tail())
     print(f"rows buffered: {len(df_live)}")
+    print(f"SAVED: {live_path}")
 
-    # Downstream usage is identical either way, e.g.:
-    #   from quant_feature_core import compute_features
-    #   feats_hist = compute_features(df_hist)
-    #   feats_live = compute_features(feed.get_dataframe())
+    print("\n=== DATA EXPORT COMPLETE ===")
+    print(f"Historical: {historical_path}")
+    print(f"Live snapshot: {live_path}")
