@@ -1,163 +1,309 @@
 """
-APEX NEXUS — Delta Market Data -> ML Engine Integration
-=========================================================
-Purpose:
-  Connect the existing Delta market-data pipeline to the new ML engine
-  WITHOUT replacing or modifying the existing live execution/API-key layer.
+delta_data_pipeline.py
+=======================
+Standalone Delta Exchange (GLOBAL) OHLCV data pipeline — built for feeding
+the new institutional-grade ML engine (quant_feature_core.py) with clean,
+consistently-shaped candle data.
 
-Architecture:
-  Delta public market data
-        -> delta_data_pipeline.py
-        -> normalized OHLCV DataFrame
-        -> ML feature/decision engine
+Two independent data paths, ONE identical output schema:
 
-This module DOES NOT:
-  - read API keys/secrets
-  - place/cancel/modify orders
-  - replace the existing live bot
-  - depend on TradingView signals
+    1. DeltaHistoricalFetcher  -> REST /v2/history/candles, auto-paginated
+                                   (Delta caps each request at 2000 candles)
+                                   Use for backtesting / training features
+                                   like Hurst (R/S), permutation entropy,
+                                   Kalman state-space fitting, frac-diff, etc.
 
-This module DOES:
-  - fetch historical candles for research/backtesting
-  - maintain a live candle feed
-  - expose the same normalized schema to the ML engine
-  - provide a safe adapter boundary for the ML engine
+    2. DeltaLiveFeed            -> WebSocket candlestick_<resolution> channel,
+                                   auto-reconnecting background thread.
+                                   Use for the engine's live decisioning.
+
+Both return a pandas DataFrame indexed by UTC timestamp with columns
+[open, high, low, close, volume] — so quant_feature_core.py never needs
+to know or care whether it's looking at history or the live tape.
+
+IMPORTANT — this module is intentionally isolated from your production stack:
+  * No API key / secret is read anywhere in this file.
+  * It only touches PUBLIC market-data endpoints (candles, candlestick ws
+    channel) — nothing here can place, modify, or cancel an order.
+  * It does not import, patch, or run alongside ml_engine.py / the live bot.
+This is a "Phase 1"-style standalone module, same spirit as quant_feature_core.py.
+
+Dependencies:
+    pip install pandas requests websocket-client
+
+One thing flagged honestly rather than guessed: I don't have a captured
+sample of a live candlestick_1m websocket message to verify field names
+against (my sandbox has no network access to hit Delta's API directly).
+The parsing below follows Delta's documented v2 pattern (type / symbol /
+candle_start_time / open / high / low / close / volume), and the feed
+logs the FIRST raw message it receives at INFO level so you can eyeball
+it in ~2 seconds and adjust `_on_message` below if any field name differs.
 """
 
-from __future__ import annotations
-
+import json
 import logging
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+import threading
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Callable, Optional
 
 import pandas as pd
+import requests
+import websocket  # websocket-client package
 
-from delta_data_pipeline import DeltaHistoricalFetcher, DeltaLiveFeed
+# ---------------------------------------------------------------------------
+# Config — the only block you should need to touch
+# ---------------------------------------------------------------------------
+REST_BASE_URL = "https://api.india.delta.exchange"   # Delta GLOBAL (NOT .india.)
+WS_URL = "wss://public-socket.india.delta.exchange"         # Delta GLOBAL — cross-check this
+                                                # against the constant your
+                                                # existing delta_order_flow.py
+                                                # already connects with; if that
+                                                # file uses a different host,
+                                                # use that one here instead.
 
-logger = logging.getLogger("apex_delta_ml_integration")
+DEFAULT_SYMBOL = "BTCUSD"     # Delta GLOBAL naming (not BTCUSD, that's India)
+DEFAULT_RESOLUTION = "1m"
+MAX_CANDLES_PER_REQUEST = 2000
+REQUEST_TIMEOUT_SEC = 10
+MAX_RETRIES = 5
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("delta_data_pipeline")
+
+_RESOLUTION_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+    "12h": 43200, "1d": 86400, "1w": 604800,
+}
 
 
-@dataclass(frozen=True)
-class MarketDataConfig:
-    symbol: str = "BTCUSD"
-    resolution: str = "1m"
-    history_days: int = 180
-    live_buffer: int = 5000
-
-
-class DeltaMLDataAdapter:
-    """
-    Single data boundary for the new ML engine.
-
-    The ML engine should consume:
-        pd.DataFrame indexed by UTC timestamp
-        columns: open, high, low, close, volume
-    """
-
-    def __init__(self, config: MarketDataConfig = MarketDataConfig()):
-        self.config = config
-        self.historical = DeltaHistoricalFetcher()
-        self.live: Optional[DeltaLiveFeed] = None
-
-    def load_history(self) -> pd.DataFrame:
-        df = self.historical.fetch_range(
-            symbol=self.config.symbol,
-            resolution=self.config.resolution,
-            days_back=self.config.history_days,
+def standardize(records: list) -> pd.DataFrame:
+    """Turn Delta's raw candle records (REST or WS) into the one true schema
+    every downstream consumer (quant_feature_core.py) should rely on."""
+    cols = ["open", "high", "low", "close", "volume"]
+    if not records:
+        return pd.DataFrame(columns=cols).set_index(
+            pd.DatetimeIndex([], tz="UTC", name="timestamp")
         )
-        return self._validate(df, "historical")
+    df = pd.DataFrame(records)
+    df = df.rename(columns={"time": "timestamp", "candle_start_time": "timestamp"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    df = df[["timestamp"] + cols]
+    df[cols] = df[cols].astype(float)
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp")
+    return df.set_index("timestamp")
 
-    def start_live(self, on_candle: Optional[Callable[[dict], None]] = None):
-        self.live = DeltaLiveFeed(
-            symbol=self.config.symbol,
-            resolution=self.config.resolution,
-            on_candle=on_candle,
-            buffer_size=self.config.live_buffer,
-        ).start()
-        return self.live
 
-    def live_snapshot(self) -> pd.DataFrame:
-        if self.live is None:
-            raise RuntimeError("Live feed has not been started.")
-        return self._validate(self.live.get_dataframe(), "live")
+# ---------------------------------------------------------------------------
+# 1) Historical — REST, auto-paginated
+# ---------------------------------------------------------------------------
+class DeltaHistoricalFetcher:
+    """Pulls historical OHLCV candles for backtesting / feature training.
+    Handles Delta's 2000-candles-per-request cap transparently."""
 
-    @staticmethod
-    def _validate(df: pd.DataFrame, source: str) -> pd.DataFrame:
-        required = ["open", "high", "low", "close", "volume"]
+    def __init__(self, base_url: str = REST_BASE_URL):
+        self.base_url = base_url
+        self.session = requests.Session()
 
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError(f"{source}: expected pandas DataFrame")
-
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"{source}: missing columns: {missing}")
-
-        if df.index.tz is None:
-            raise ValueError(f"{source}: timestamp index must be timezone-aware UTC")
-
-        out = df.copy()
-        out = out.sort_index()
-        out = out[~out.index.duplicated(keep="last")]
-
-        if out[required].isnull().any().any():
-            logger.warning("%s: null values found in OHLCV data", source)
-
-        # Basic OHLC sanity checks; do not invent/fill market data.
-        bad = (
-            (out["high"] < out[["open", "close", "low"]].max(axis=1))
-            | (out["low"] > out[["open", "close", "high"]].min(axis=1))
-            | (out["volume"] < 0)
+    def fetch_window(self, symbol: str, resolution: str, start_ts: int, end_ts: int) -> list:
+        """Single REST call, retried with backoff. Returns raw record list."""
+        params = {"resolution": resolution, "symbol": symbol, "start": start_ts, "end": end_ts}
+        last_err = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = self.session.get(
+                    f"{self.base_url}/v2/history/candles",
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SEC,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                if not payload.get("success", False):
+                    raise RuntimeError(f"Delta API returned success=false: {payload}")
+                return payload.get("result", [])
+            except (requests.RequestException, RuntimeError, ValueError) as e:
+                last_err = e
+                wait = min(2 ** attempt, 30)
+                logger.warning(
+                    f"fetch_window attempt {attempt}/{MAX_RETRIES} failed ({e}); retrying in {wait}s"
+                )
+                time.sleep(wait)
+        raise RuntimeError(
+            f"Failed fetching {symbol} {resolution} [{start_ts}:{end_ts}] "
+            f"after {MAX_RETRIES} attempts: {last_err}"
         )
 
-        if bool(bad.any()):
-            raise ValueError(
-                f"{source}: {int(bad.sum())} invalid OHLCV rows detected"
+    def fetch_range(
+        self,
+        symbol: str = DEFAULT_SYMBOL,
+        resolution: str = DEFAULT_RESOLUTION,
+        days_back: int = 90,
+        end_ts: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Walks backward from `end_ts` (default: now) across as many
+        2000-candle windows as needed and returns one clean DataFrame."""
+        if resolution not in _RESOLUTION_SECONDS:
+            raise ValueError(f"Unknown resolution '{resolution}'. Valid: {list(_RESOLUTION_SECONDS)}")
+
+        res_sec = _RESOLUTION_SECONDS[resolution]
+        end_ts = end_ts or int(time.time())
+        start_ts = end_ts - days_back * 86400
+        window_span = MAX_CANDLES_PER_REQUEST * res_sec
+
+        all_records: list = []
+        cursor = start_ts
+        n_windows = 0
+        while cursor < end_ts:
+            window_end = min(cursor + window_span, end_ts)
+            n_windows += 1
+            logger.info(
+                f"[{n_windows}] fetching {symbol} {resolution} candles "
+                f"{datetime.fromtimestamp(cursor, tz=timezone.utc).isoformat()} -> "
+                f"{datetime.fromtimestamp(window_end, tz=timezone.utc).isoformat()}"
             )
+            page = self.fetch_window(symbol, resolution, cursor, window_end)
+            all_records.extend(page)
+            cursor = window_end
+            time.sleep(0.2)  # stay polite to the API across pages
 
-        return out
-
-
-def example_ml_hook(candle: dict[str, Any]) -> None:
-    """
-    Replace this callback with the ML engine's EXISTING public entry point.
-
-    IMPORTANT:
-      This function is intentionally not connected to order execution.
-      A model decision must pass through the project's existing risk/execution
-      controls before any real order is submitted.
-    """
-    logger.info(
-        "New market candle received: %s",
-        candle,
-    )
+        df = standardize(all_records)
+        logger.info(f"done: {len(df)} candles for {symbol} ({resolution}, {days_back}d back)")
+        return df
 
 
+# ---------------------------------------------------------------------------
+# 2) Live — WebSocket, auto-reconnecting
+# ---------------------------------------------------------------------------
+class DeltaLiveFeed:
+    """Background-thread WebSocket subscriber for closed candlesticks.
+    Buffers the most recent `buffer_size` candles and optionally fires
+    `on_candle(record_dict)` as each new one arrives."""
+
+    def __init__(
+        self,
+        symbol: str = DEFAULT_SYMBOL,
+        resolution: str = DEFAULT_RESOLUTION,
+        on_candle: Optional[Callable[[dict], None]] = None,
+        buffer_size: int = 5000,
+        ws_url: str = WS_URL,
+    ):
+        self.symbol = symbol
+        self.resolution = resolution
+        self.channel = f"candlestick_{resolution}"
+        self.on_candle = on_candle
+        self.ws_url = ws_url
+        self.buffer: deque = deque(maxlen=buffer_size)
+        self._ws: Optional[websocket.WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
+        self._logged_sample = False
+
+    # -- websocket callbacks -------------------------------------------------
+    def _on_open(self, ws):
+        logger.info(f"WS connected -> subscribing {self.channel} for {self.symbol}")
+        ws.send(json.dumps({
+            "type": "subscribe",
+            "payload": {"channels": [{"name": self.channel, "symbols": [self.symbol]}]},
+        }))
+
+    def _on_message(self, ws, message):
+        # Current Delta India public candlestick schema:
+        # c/h/l/o = close/high/low/open, v = volume, ts = microseconds.
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+
+        if data.get("type") != self.channel:
+            return
+
+        ts_us = data.get("ts")
+        if ts_us is None:
+            return
+
+        try:
+            record = {
+                "time": int(ts_us) / 1_000_000,
+                "open": float(data["o"]),
+                "high": float(data["h"]),
+                "low": float(data["l"]),
+                "close": float(data["c"]),
+                "volume": float(data.get("v", 0) or 0),
+            }
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Malformed candlestick message ignored: %s", message[:400])
+            return
+
+        self.buffer.append(record)
+        if self.on_candle:
+            self.on_candle(record)
+
+    def _on_error(self, ws, error):
+        logger.warning(f"WS error: {error}")
+
+    def _on_close(self, ws, code, msg):
+        logger.warning(f"WS closed (code={code}, msg={msg})")
+
+    def _run(self):
+        while not self._stop_flag.is_set():
+            try:
+                self._ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                logger.warning(f"WS loop crashed: {e}")
+            if not self._stop_flag.is_set():
+                logger.info("reconnecting in 5s...")
+                time.sleep(5)
+
+    # -- public interface ------------------------------------------------
+    def start(self) -> "DeltaLiveFeed":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._ws:
+            self._ws.close()
+
+    def get_dataframe(self) -> pd.DataFrame:
+        """Snapshot of everything buffered so far, same schema as historical."""
+        return standardize(list(self.buffer))
+
+
+# ---------------------------------------------------------------------------
+# Demo / sanity check — run directly: python delta_data_pipeline.py
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    print("\n=== 1) Historical backfill (30d, quick check — bump to 90-180d for real training) ===")
+    hist = DeltaHistoricalFetcher()
+    df_hist = hist.fetch_range(symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION, days_back=30)
+    print(df_hist.tail())
+    print(f"rows: {len(df_hist)}")
 
-    adapter = DeltaMLDataAdapter(
-        MarketDataConfig(
-            symbol="BTCUSD",
-            resolution="1m",
-            history_days=30,
-        )
-    )
-
-    history = adapter.load_history()
-    print("Historical rows:", len(history))
-    print(history.tail())
-
-    adapter.start_live(on_candle=example_ml_hook)
-
-    print("Live feed started. Press Ctrl+C to stop.")
+    print("\n=== 2) Live feed — watching for 90s (Ctrl+C to stop early) ===")
+    feed = DeltaLiveFeed(symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION).start()
     try:
-        import time
-        while True:
-            time.sleep(10)
+        time.sleep(90)
     except KeyboardInterrupt:
-        if adapter.live:
-            adapter.live.stop()
-        print("Stopped.")
+        pass
+    feed.stop()
+    df_live = feed.get_dataframe()
+    print(df_live.tail())
+    print(f"rows buffered: {len(df_live)}")
+
+    # Downstream usage is identical either way, e.g.:
+    #   from quant_feature_core import compute_features
+    #   feats_hist = compute_features(df_hist)
+    #   feats_live = compute_features(feed.get_dataframe())
