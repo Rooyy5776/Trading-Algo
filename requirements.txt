@@ -7,3 +7,6 @@ aiohttp
 pandas>=2.0,<3
 requests>=2.31,<3
 websocket-client>=1.7,<2
+pandas>=2.0
+requests>=2.31
+websocket-client>=1.7
